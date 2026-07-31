@@ -39,7 +39,6 @@ from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pymongo import MongoClient, ReturnDocument
 
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Config / Mongo connection
