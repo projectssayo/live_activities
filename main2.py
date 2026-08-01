@@ -277,7 +277,7 @@ async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
 @app.head("/")
 def root():
     """Simple liveness/ping endpoint (also handy for uptime monitors / Render health checks)."""
-    return {"success": True,"updated_at":"0801 1436"}
+    return {"success": True}
 
 
 @app.get("/status")
