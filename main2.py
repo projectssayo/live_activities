@@ -37,15 +37,16 @@ socket_mac: Dict[str, str] = {}
 # lid shut, etc.) and flip the user offline. Worst case latency before a user
 # is marked offline is roughly HEARTBEAT_IDLE_TIMEOUT + HEARTBEAT_PING_TIMEOUT.
 #
-# FIX: these were previously 1.5s / 1.5s. That's far too aggressive for a
-# real network -- brief wifi hiccups, mobile network handoffs, or a
-# momentary event-loop stall on either side can easily exceed a 3s round
-# trip, which was causing users to be flipped offline (and immediately
-# back online on the next message) every few seconds even while their
-# connection was perfectly healthy. Loosened to give real jitter some
-# room, while still detecting a truly dead socket well within ~15s.
-HEARTBEAT_IDLE_TIMEOUT = 10.0   # seconds of silence before we actively probe the socket
-HEARTBEAT_PING_TIMEOUT = 5.0    # seconds to wait for any reply to that probe
+# FIX: the original 1.5s / 1.5s values weren't actually the problem -- the
+# client simply never answered the ping (see LiveActivityWebSocketThread),
+# so EVERY probe timed out and users got flipped offline constantly. Now
+# that the client replies with "pong" immediately on a healthy connection,
+# it's safe to run these tight again for WhatsApp/Telegram-style snappy
+# presence: worst-case time to detect a dead socket is
+# HEARTBEAT_IDLE_TIMEOUT + HEARTBEAT_PING_TIMEOUT ~= 3s, and a live client
+# answers well within that, so there's no flapping risk anymore.
+HEARTBEAT_IDLE_TIMEOUT = 2.0   # seconds of silence before we actively probe the socket
+HEARTBEAT_PING_TIMEOUT = 1.0   # seconds to wait for any reply to that probe
 
 
 def sanitize_email(email: str) -> str:
@@ -280,7 +281,7 @@ async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
 @app.head("/")
 def root():
     """Simple liveness/ping endpoint (also handy for uptime monitors / Render health checks)."""
-    return {"success": True,"temp":"1515"}
+    return {"success": True}
 
 
 @app.get("/status")
