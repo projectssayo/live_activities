@@ -8,7 +8,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pymongo import MongoClient, ReturnDocument
 
 
-
 MONGO_USERNAME = "suyognegi_global"
 MONGO_PASSWORD = "Oj5eGphIUUud9YvY"
 
@@ -37,9 +36,16 @@ socket_mac: Dict[str, str] = {}
 # How fast we detect a dead connection (app closed, wifi/data dropped, laptop
 # lid shut, etc.) and flip the user offline. Worst case latency before a user
 # is marked offline is roughly HEARTBEAT_IDLE_TIMEOUT + HEARTBEAT_PING_TIMEOUT.
-HEARTBEAT_IDLE_TIMEOUT = 1.5   # seconds of silence before we actively probe the socket
-HEARTBEAT_PING_TIMEOUT = 1.5   # seconds to wait for any reply to that probe
-
+#
+# FIX: these were previously 1.5s / 1.5s. That's far too aggressive for a
+# real network -- brief wifi hiccups, mobile network handoffs, or a
+# momentary event-loop stall on either side can easily exceed a 3s round
+# trip, which was causing users to be flipped offline (and immediately
+# back online on the next message) every few seconds even while their
+# connection was perfectly healthy. Loosened to give real jitter some
+# room, while still detecting a truly dead socket well within ~15s.
+HEARTBEAT_IDLE_TIMEOUT = 10.0   # seconds of silence before we actively probe the socket
+HEARTBEAT_PING_TIMEOUT = 5.0    # seconds to wait for any reply to that probe
 
 
 def sanitize_email(email: str) -> str:
@@ -60,7 +66,6 @@ def get_chat_id(email1: str, email2: str) -> str:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
 
 
 def set_user_online(email: str) -> None:
@@ -130,8 +135,6 @@ def record_login(email: str, mac_id: str) -> None:
 def get_registered_mac(email: str) -> Optional[str]:
     doc = logged_in_col.find_one({"_id": email})
     return doc.get("mac_id") if doc else None
-
-
 
 
 async def notify_peer(peer_email: str, changed_email: str) -> None:
@@ -289,7 +292,6 @@ def get_status(me: str, friend: str):
 
     me_field = sanitize_email(me)
     friend_field = sanitize_email(friend)
-
 
     my_last_clicked = clicked_doc[me_field] if me_field in clicked_doc else None
     friend_last_clicked = clicked_doc[friend_field] if friend_field in clicked_doc else None
