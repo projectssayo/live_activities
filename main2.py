@@ -37,6 +37,14 @@ HEARTBEAT_IDLE_TIMEOUT = 2.0   # seconds of silence before we actively probe the
 HEARTBEAT_PING_TIMEOUT = 1.0   # seconds to wait for any reply to that probe
 
 
+@app.on_event("startup")
+def strip_legacy_presence_fields():
+    last_seen_col.update_many(
+        {},
+        {"$unset": {"online": "", "last_seen": ""}},
+    )
+
+
 def sanitize_email(email: str) -> str:
     return email.replace(".", "dot").replace("@", "at")
 
@@ -51,10 +59,22 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Legacy field names from an older version of this service. If any older
+# process is still writing "online" / "last_seen" to this same collection,
+# those fields go stale and disagree with "is_online" / "last_seen_at"
+# (which this file actually maintains). We proactively $unset them on
+# every write we make so documents self-heal back to the current schema
+# instead of keeping two conflicting presence fields forever.
+LEGACY_PRESENCE_FIELDS = {"online": "", "last_seen": ""}
+
+
 def set_user_online(email: str) -> None:
     last_seen_col.update_one(
         {"_id": email},
-        {"$set": {"is_online": True, "last_seen_at": now_utc()}},
+        {
+            "$set": {"is_online": True, "last_seen_at": now_utc()},
+            "$unset": LEGACY_PRESENCE_FIELDS,
+        },
         upsert=True,
     )
 
@@ -63,7 +83,10 @@ def set_user_offline(email: str, at: Optional[datetime] = None) -> dict:
     ts = at or now_utc()
     return last_seen_col.find_one_and_update(
         {"_id": email},
-        {"$set": {"is_online": False, "last_seen_at": ts, "user_is_on": None}},
+        {
+            "$set": {"is_online": False, "last_seen_at": ts, "user_is_on": None},
+            "$unset": LEGACY_PRESENCE_FIELDS,
+        },
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
