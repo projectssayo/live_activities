@@ -37,8 +37,8 @@ socket_mac: Dict[str, str] = {}
 # How fast we detect a dead connection (app closed, wifi/data dropped, laptop
 # lid shut, etc.) and flip the user offline. Worst case latency before a user
 # is marked offline is roughly HEARTBEAT_IDLE_TIMEOUT + HEARTBEAT_PING_TIMEOUT.
-HEARTBEAT_IDLE_TIMEOUT = 8   # seconds of silence before we actively probe the socket
-HEARTBEAT_PING_TIMEOUT = 6   # seconds to wait for any reply to that probe
+HEARTBEAT_IDLE_TIMEOUT = 1.5   # seconds of silence before we actively probe the socket
+HEARTBEAT_PING_TIMEOUT = 1.5   # seconds to wait for any reply to that probe
 
 
 
