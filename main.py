@@ -9,10 +9,10 @@ Deployable FastAPI service that tracks:
   - which mac_id is currently authorised for a given account (multi-login
     detection)
 
-DB: live_activites
+DB: live_activities
 Collections:
   last_seen             _id=email  {is_online, user_is_on, last_seen_at}
-  last_clicked_on_table _id=chat{...} {<sanitized_email>: datetime, ...}
+  last_clicked_on_table _id=chat_{email1}_{email2} {<sanitized_email>: datetime, ...}
   logged_in_at          _id=email  {logged_in_at, mac_id}
 
 Run locally:
@@ -23,11 +23,11 @@ Run locally:
     MONGO_USERNAME=your_mongo_user
     MONGO_PASSWORD=your_mongo_password
 
-Deploy behind your reverse proxy at:
-    https://www.zyro.chat.just.co
+Deploy at:
+    https://zyro-main-app-live-activities-api.onrender.com
 so that:
-    REST         ->  https://www.zyro.chat.just.co/...
-    WebSocket    ->  wss://www.zyro.chat.just.co/ws/{email}/{mac_id}
+    REST         ->  https://zyro-main-app-live-activities-api.onrender.com/...
+    WebSocket    ->  wss://zyro-main-app-live-activities-api.onrender.com/ws/{email}/{mac_id}
 ---------------------------------------------------------------------------
 """
 
@@ -58,7 +58,7 @@ client = MongoClient(
     socketTimeoutMS=10000,
 )
 
-db = client["live_activites"]
+db = client["live_activities"]
 last_seen_col = db["last_seen"]
 last_clicked_col = db["last_clicked_on_table"]
 logged_in_col = db["logged_in_at"]
@@ -75,17 +75,19 @@ socket_mac: Dict[str, str] = {}
 # Helpers
 # ---------------------------------------------------------------------------
 def sanitize_email(email: str) -> str:
-    """Mongo field names can't contain '.' -- make an email field-safe."""
+    """Mongo field *names* (keys inside a document) can't contain '.' --
+    make an email field-safe for use as a document key. NOT used for the
+    chat_id itself, since _id values are free-form strings and can contain
+    '.' and '@' just fine."""
     return email.replace(".", "dot").replace("@", "at")
 
 
 def get_chat_id(email1: str, email2: str) -> str:
-    """Canonical, order-stable id for a 1-1 chat between two emails."""
-    e1 = sanitize_email(email1)
-    e2 = sanitize_email(email2)
+    """Canonical, order-stable, human-readable id for a 1-1 chat between
+    two emails, e.g. chat_suyognegi1@gmail.com_dacida3565@fishnon.com"""
     if email1 < email2:
-        return f"chat{e2}_{e1}"
-    return f"chat{e1}_{e2}"
+        return f"chat_{email2}_{email1}"
+    return f"chat_{email1}_{email2}"
 
 
 def now_utc() -> datetime:
@@ -233,6 +235,13 @@ async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
 # ---------------------------------------------------------------------------
 # REST endpoints
 # ---------------------------------------------------------------------------
+@app.get("/")
+@app.head("/")
+def root():
+    """Simple liveness/ping endpoint (also handy for uptime monitors / Render health checks)."""
+    return {"success": True}
+
+
 @app.get("/status")
 def get_status(me: str, friend: str):
     """Everything the UI needs to render a friend's presence + chat context."""
