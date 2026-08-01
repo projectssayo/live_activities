@@ -130,13 +130,27 @@ def touch_last_clicked(email: str, target_email: str, at: Optional[datetime] = N
     """Stamp `email`'s side of the 1-1 chat with `target_email`.
     Pass `at` to reuse an exact timestamp already generated elsewhere
     (e.g. the same instant the user was marked offline) so the two
-    records agree precisely instead of drifting by a few ms."""
+    records agree precisely instead of drifting by a few ms.
+
+    Also guarantees the chat document always has a field for BOTH
+    participants: if `target_email`'s field isn't present on this
+    document yet, it's created and initialized to None (null) instead
+    of being left missing.
+    """
     chat_id = get_chat_id(email, target_email)
     field = sanitize_email(email)
+    other_field = sanitize_email(target_email)
+
     last_clicked_col.update_one(
         {"_id": chat_id},
         {"$set": {field: at or now_utc()}},
         upsert=True,
+    )
+    # Only initialize the other participant's field if it doesn't already
+    # exist -- never clobber a real timestamp they already have.
+    last_clicked_col.update_one(
+        {"_id": chat_id, other_field: {"$exists": False}},
+        {"$set": {other_field: None}},
     )
 
 
