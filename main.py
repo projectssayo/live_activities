@@ -105,10 +105,14 @@ def set_user_online(email: str) -> None:
     )
 
 
-def set_user_offline(email: str) -> dict:
+def set_user_offline(email: str, at: Optional[datetime] = None) -> dict:
+    """Flip is_online False as fast as possible. `at` lets the caller pin
+    this write to the exact same timestamp used elsewhere (e.g. the matching
+    last_clicked stamp), so the two stay perfectly in sync."""
+    ts = at or now_utc()
     return last_seen_col.find_one_and_update(
         {"_id": email},
-        {"$set": {"is_online": False, "last_seen_at": now_utc(), "user_is_on": None}},
+        {"$set": {"is_online": False, "last_seen_at": ts, "user_is_on": None}},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
@@ -122,13 +126,16 @@ def set_user_chat_target(email: str, target_email: Optional[str]) -> None:
     )
 
 
-def touch_last_clicked(email: str, target_email: str) -> None:
-    """Stamp `email`'s side of the 1-1 chat with `target_email` as 'now'."""
+def touch_last_clicked(email: str, target_email: str, at: Optional[datetime] = None) -> None:
+    """Stamp `email`'s side of the 1-1 chat with `target_email`.
+    Pass `at` to reuse an exact timestamp already generated elsewhere
+    (e.g. the same instant the user was marked offline) so the two
+    records agree precisely instead of drifting by a few ms."""
     chat_id = get_chat_id(email, target_email)
     field = sanitize_email(email)
     last_clicked_col.update_one(
         {"_id": chat_id},
-        {"$set": {field: now_utc()}},
+        {"$set": {field: at or now_utc()}},
         upsert=True,
     )
 
@@ -192,17 +199,30 @@ async def handle_event(email: str, data: dict) -> None:
 
 
 async def cleanup_user(email: str) -> None:
-    """Runs on clean disconnect AND on crash/dead-socket detection alike."""
+    """Runs on clean disconnect AND on crash/dead-socket detection alike.
+
+    Ordering matters here for both speed and accuracy:
+      1. Drop the in-memory socket refs immediately (no DB round trip).
+      2. Flip is_online -> False right away -- this is the single most
+         important, time-sensitive write, so it goes out first and on
+         its own, before anything else touches the DB.
+      3. Only after that, backfill the last_clicked table for whichever
+         chat the user had open, using the *exact same timestamp* that
+         was just written to last_seen_at, so "last seen" and "last
+         clicked" agree to the microsecond instead of two separate
+         now_utc() calls drifting apart.
+    """
     connected_users.pop(email, None)
     socket_mac.pop(email, None)
 
     prev = last_seen_col.find_one({"_id": email}) or {}
     target_email = prev.get("user_is_on")
 
-    set_user_offline(email)
+    ts = now_utc()
+    set_user_offline(email, at=ts)
 
     if target_email:
-        touch_last_clicked(email, target_email)
+        touch_last_clicked(email, target_email, at=ts)
         await notify_peer(target_email, email)
 
 
@@ -252,14 +272,20 @@ def get_status(me: str, friend: str):
     me_field = sanitize_email(me)
     friend_field = sanitize_email(friend)
 
+    # Explicit: if this participant has never clicked into this chat yet,
+    # their field simply won't exist in clicked_doc -- make sure that comes
+    # back as a clean None rather than relying on an implicit default.
+    my_last_clicked = clicked_doc[me_field] if me_field in clicked_doc else None
+    friend_last_clicked = clicked_doc[friend_field] if friend_field in clicked_doc else None
+
     return {
         "friend_email": friend,
         "is_online": friend_doc.get("is_online", False),
         "user_is_on": friend_doc.get("user_is_on"),
         "last_seen_at": friend_doc.get("last_seen_at"),
         "is_on_same_chat_as_me": friend_doc.get("user_is_on") == me,
-        "my_last_clicked": clicked_doc.get(me_field),
-        "friend_last_clicked": clicked_doc.get(friend_field),
+        "my_last_clicked": my_last_clicked,
+        "friend_last_clicked": friend_last_clicked,
     }
 
 
