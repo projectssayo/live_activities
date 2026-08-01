@@ -1,36 +1,4 @@
-"""
-live_activity_api.py
----------------------------------------------------------------------------
-Deployable FastAPI service that tracks:
-  - who is online / offline
-  - which friend-chat a user currently has open ("user_is_on")
-  - last-seen timestamps
-  - per-chat "last clicked" timestamps (per participant)
-  - which mac_id is currently authorised for a given account (multi-login
-    detection)
-
-DB: live_activities
-Collections:
-  last_seen             _id=email  {is_online, user_is_on, last_seen_at}
-  last_clicked_on_table _id=chat_{email1}_{email2} {<sanitized_email>: datetime, ...}
-  logged_in_at          _id=email  {logged_in_at, mac_id}
-
-Run locally:
-    pip install fastapi "uvicorn[standard]" pymongo python-dotenv dnspython
-    uvicorn live_activity_api:app --host 0.0.0.0 --port 8000
-
-.env (same folder) should contain:
-    MONGO_USERNAME=your_mongo_user
-    MONGO_PASSWORD=your_mongo_password
-
-Deploy at:
-    https://zyro-main-app-live-activities-api.onrender.com
-so that:
-    REST         ->  https://zyro-main-app-live-activities-api.onrender.com/...
-    WebSocket    ->  wss://zyro-main-app-live-activities-api.onrender.com/ws/{email}/{mac_id}
----------------------------------------------------------------------------
-"""
-
+import asyncio
 import os
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -40,9 +8,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pymongo import MongoClient, ReturnDocument
 
 
-# ---------------------------------------------------------------------------
-# Config / Mongo connection
-# ---------------------------------------------------------------------------
+
 MONGO_USERNAME = "suyognegi_global"
 MONGO_PASSWORD = "Oj5eGphIUUud9YvY"
 
@@ -65,15 +31,17 @@ logged_in_col = db["logged_in_at"]
 
 app = FastAPI(title="Zyro Live Activity Service")
 
-# email -> live websocket connection (single active session per email)
 connected_users: Dict[str, WebSocket] = {}
-# email -> mac_id currently bound to the live socket
 socket_mac: Dict[str, str] = {}
 
+# How fast we detect a dead connection (app closed, wifi/data dropped, laptop
+# lid shut, etc.) and flip the user offline. Worst case latency before a user
+# is marked offline is roughly HEARTBEAT_IDLE_TIMEOUT + HEARTBEAT_PING_TIMEOUT.
+HEARTBEAT_IDLE_TIMEOUT = 1.5   # seconds of silence before we actively probe the socket
+HEARTBEAT_PING_TIMEOUT = 1.5   # seconds to wait for any reply to that probe
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+
+
 def sanitize_email(email: str) -> str:
     """Mongo field *names* (keys inside a document) can't contain '.' --
     make an email field-safe for use as a document key. NOT used for the
@@ -94,9 +62,7 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# ---------------------------------------------------------------------------
-# Mongo writers (all upserts, as requested)
-# ---------------------------------------------------------------------------
+
 def set_user_online(email: str) -> None:
     last_seen_col.update_one(
         {"_id": email},
@@ -146,8 +112,7 @@ def touch_last_clicked(email: str, target_email: str, at: Optional[datetime] = N
         {"$set": {field: at or now_utc()}},
         upsert=True,
     )
-    # Only initialize the other participant's field if it doesn't already
-    # exist -- never clobber a real timestamp they already have.
+
     last_clicked_col.update_one(
         {"_id": chat_id, other_field: {"$exists": False}},
         {"$set": {other_field: None}},
@@ -167,9 +132,8 @@ def get_registered_mac(email: str) -> Optional[str]:
     return doc.get("mac_id") if doc else None
 
 
-# ---------------------------------------------------------------------------
-# WebSocket: presence + chat-open/close events
-# ---------------------------------------------------------------------------
+
+
 async def notify_peer(peer_email: str, changed_email: str) -> None:
     """Push changed_email's fresh presence doc to peer_email if connected."""
     peer_ws = connected_users.get(peer_email)
@@ -213,7 +177,9 @@ async def handle_event(email: str, data: dict) -> None:
 
 
 async def cleanup_user(email: str) -> None:
-    """Runs on clean disconnect AND on crash/dead-socket detection alike.
+    """Runs on clean disconnect, on a dead/timed-out socket, AND on crash
+    alike -- this is the single place that takes a user offline, so it's
+    guaranteed to fire exactly once per session no matter how it ended.
 
     Ordering matters here for both speed and accuracy:
       1. Drop the in-memory socket refs immediately (no DB round trip).
@@ -226,6 +192,11 @@ async def cleanup_user(email: str) -> None:
          clicked" agree to the microsecond instead of two separate
          now_utc() calls drifting apart.
     """
+    # already cleaned up (e.g. heartbeat timeout raced with a disconnect
+    # event) -- nothing to do.
+    if connected_users.get(email) is None and socket_mac.get(email) is None:
+        return
+
     connected_users.pop(email, None)
     socket_mac.pop(email, None)
 
@@ -254,15 +225,48 @@ async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
 
     try:
         while True:
-            # `websockets` (the library uvicorn uses under the hood) sends/expects
-            # protocol-level ping/pong automatically and raises a close/error
-            # here the moment the peer goes dark -- no custom heartbeat needed.
-            data = await websocket.receive_json()
+            # Normal path: wait for a message, but never longer than
+            # HEARTBEAT_IDLE_TIMEOUT. If the client goes quiet (app killed,
+            # wifi/data dropped, laptop put to sleep, etc.) we don't want to
+            # rely on the OS to eventually notice the TCP connection died --
+            # that can take minutes. Instead we actively probe as soon as
+            # the idle window elapses.
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=HEARTBEAT_IDLE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_json({"type": "ping"})
+                    reply = await asyncio.wait_for(
+                        websocket.receive_json(), timeout=HEARTBEAT_PING_TIMEOUT
+                    )
+                except Exception:
+                    # No reply at all -> connection is dead. Go offline now
+                    # instead of waiting for a socket-level error that may
+                    # never come (silent network drop).
+                    break
+                if reply.get("type") != "pong":
+                    await handle_event(email, reply)
+                continue
+
+            if data.get("type") == "pong":
+                # client answered our probe on its own initiative -- just
+                # proof of life, nothing to process.
+                continue
+
             await handle_event(email, data)
     except WebSocketDisconnect:
-        await cleanup_user(email)
+        # app was closed / user hit the close button -- clean, immediate
+        # disconnect frame received, no need to wait for a heartbeat.
+        pass
     except Exception:
-        # covers crashed clients / dropped connections detected by ping/pong
+        # any other socket-level failure (crash, abrupt network drop, etc.)
+        pass
+    finally:
+        # Single, guaranteed exit point: whether the socket closed cleanly,
+        # errored out, or the heartbeat probe above gave up on it, the user
+        # gets marked offline here immediately -- no duplicate/racing calls.
         await cleanup_user(email)
 
 
@@ -286,9 +290,7 @@ def get_status(me: str, friend: str):
     me_field = sanitize_email(me)
     friend_field = sanitize_email(friend)
 
-    # Explicit: if this participant has never clicked into this chat yet,
-    # their field simply won't exist in clicked_doc -- make sure that comes
-    # back as a clean None rather than relying on an implicit default.
+
     my_last_clicked = clicked_doc[me_field] if me_field in clicked_doc else None
     friend_last_clicked = clicked_doc[friend_field] if friend_field in clicked_doc else None
 
