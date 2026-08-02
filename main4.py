@@ -29,7 +29,7 @@ last_seen_col = db["last_seen"]
 last_clicked_col = db["last_clicked_on_table"]
 logged_in_col = db["logged_in_at"]
 
-# ---- NEW: friend-list db, used to figure out who to notify on presence change ----
+# ---- friend-list db, used to figure out who to notify on presence change ----
 user_db = client["user_db"]
 all_type_list_col = user_db["all_type_list_table"]
 
@@ -49,8 +49,8 @@ def strip_legacy_presence_fields():
         {"$unset": {"online": "", "last_seen": ""}},
     )
     # speeds up "who has this email in their friend_list" lookups used by
-    # broadcast_presence_to_friends() below, which now runs on every
-    # connect/disconnect instead of only on chat-open/close.
+    # broadcast_presence_to_friends() below, which runs on every
+    # connect/disconnect, not just on chat-open/close.
     all_type_list_col.create_index("friend_list")
 
 
@@ -140,7 +140,7 @@ def get_registered_mac(email: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------
-# NEW: friend-list aware broadcast
+# friend-list aware broadcast
 # ---------------------------------------------------------------------
 
 def get_watchers_of(email: str) -> List[str]:
@@ -192,6 +192,33 @@ async def broadcast_presence_to_friends(changed_email: str) -> None:
             pass
 
 
+# ---------------------------------------------------------------------
+# NEW: bulk snapshot reply, used the instant a client's socket connects
+# so it doesn't have to wait for the next presence change / next poll
+# cycle to find out where its friends currently stand.
+# ---------------------------------------------------------------------
+async def send_bulk_presence(requester_email: str, friend_emails: List[str]) -> None:
+    ws = connected_users.get(requester_email)
+    if ws is None or not friend_emails:
+        return
+
+    docs = last_seen_col.find({"_id": {"$in": friend_emails}})
+    updates = []
+    for doc in docs:
+        last_seen_at = doc.get("last_seen_at")
+        updates.append({
+            "email": doc["_id"],
+            "is_online": doc.get("is_online", False),
+            "user_is_on": doc.get("user_is_on"),
+            "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+        })
+
+    try:
+        await ws.send_json({"type": "bulk_presence", "updates": updates})
+    except Exception:
+        pass
+
+
 async def handle_event(email: str, data: dict) -> None:
     event_type = data.get("type")
 
@@ -211,6 +238,13 @@ async def handle_event(email: str, data: dict) -> None:
             touch_last_clicked(email, target_email)
             await notify_peer(target_email, email)
 
+    # NEW: client asks "give me my friends' current status right now" --
+    # sent right after the socket connects so the UI doesn't sit stale
+    # waiting on the next change event or the periodic sqlite re-sync.
+    elif event_type == "sync_request":
+        friend_emails = data.get("friend_list") or []
+        await send_bulk_presence(email, friend_emails)
+
 
 async def cleanup_user(email: str) -> None:
     if connected_users.get(email) is None and socket_mac.get(email) is None:
@@ -229,7 +263,7 @@ async def cleanup_user(email: str) -> None:
         touch_last_clicked(email, target_email, at=ts)
         await notify_peer(target_email, email)
 
-    # NEW: tell everyone who has this user as a friend that they just went offline
+    # tell everyone who has this user as a friend that they just went offline
     await broadcast_presence_to_friends(email)
 
 
@@ -243,7 +277,7 @@ async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
     set_user_online(email)
     record_login(email, mac_id)
 
-    # NEW: tell everyone who has this user as a friend that they just came online
+    # tell everyone who has this user as a friend that they just came online
     await broadcast_presence_to_friends(email)
 
     try:
@@ -306,8 +340,9 @@ def get_status(me: str, friend: str):
 
 
 # ---------------------------------------------------------------------
-# NEW: bulk fetch used by the client's LastSeenSyncThread on startup
-# (and periodically) to reconcile the local sqlite cache against Mongo.
+# bulk REST fetch used by the client's LastSeenSyncThread as a periodic
+# safety-net reconciliation (the websocket sync_request/bulk_presence
+# path above is now the primary, low-latency path).
 # ---------------------------------------------------------------------
 @app.get("/friends_last_seen")
 def friends_last_seen(emails: str):
