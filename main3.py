@@ -155,12 +155,22 @@ async def notify_peer(peer_email: str, changed_email: str) -> None:
         return
     doc = last_seen_col.find_one({"_id": changed_email}) or {}
     last_seen_at = doc.get("last_seen_at")
+
+    # "when did changed_email (the friend, from peer_email's point of view)
+    # last click into this chat" -- read straight from last_clicked_on_table
+    # using the same chat_id / sanitized-field scheme as touch_last_clicked.
+    chat_id = get_chat_id(peer_email, changed_email)
+    clicked_doc = last_clicked_col.find_one({"_id": chat_id}) or {}
+    changed_field = sanitize_email(changed_email)
+    friend_last_clicked = clicked_doc.get(changed_field)  # None if never clicked
+
     payload = {
         "type": "presence_update",
         "email": changed_email,
         "is_online": doc.get("is_online", False),
         "user_is_on": doc.get("user_is_on"),
         "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+        "friend_last_clicked": friend_last_clicked.isoformat() if friend_last_clicked else None,
     }
     try:
         await peer_ws.send_json(payload)
@@ -321,16 +331,24 @@ def friend_presence_bulk(me: str):
     or after a period offline."""
     friends = get_friend_list(me)
     docs = {d["_id"]: d for d in last_seen_col.find({"_id": {"$in": friends}})}
+    me_field_for_chat = {f: get_chat_id(me, f) for f in friends}
+    clicked_docs = {
+        d["_id"]: d
+        for d in last_clicked_col.find({"_id": {"$in": list(me_field_for_chat.values())}})
+    }
     out = []
     for f in friends:
         d = docs.get(f, {})
         ts = d.get("last_seen_at")
+        clicked_doc = clicked_docs.get(me_field_for_chat[f], {})
+        friend_last_clicked = clicked_doc.get(sanitize_email(f))
         out.append(
             {
                 "email": f,
                 "is_online": d.get("is_online", False),
                 "user_is_on": d.get("user_is_on"),
                 "last_seen_at": ts.isoformat() if ts else None,
+                "friend_last_clicked": friend_last_clicked.isoformat() if friend_last_clicked else None,
             }
         )
     return {"friends": out}
