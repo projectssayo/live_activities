@@ -518,7 +518,38 @@ async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
         pass
     finally:
         await cleanup_user(email)
+@app.get("/friends_last_seen")
+async def friends_last_seen(emails: str):
+    """REST equivalent of send_bulk_presence, for the client's one-shot
+    reconciliation pass after coming back online. Served from
+    presence_state where possible; falls back to Mongo for anything
+    not yet cached, and backfills the cache with what it finds."""
+    email_list = [e for e in emails.split(",") if e]
+    if not email_list:
+        return {}
 
+    result = {}
+    missing = []
+    for email in email_list:
+        state = presence_state.get(email)
+        if state is None:
+            missing.append(email)
+        else:
+            result[email] = {
+                "is_online": state.get("is_online", False),
+                "last_seen_at": state.get("last_seen_at"),
+            }
+
+    if missing:
+        fetched = await run_blocking(_load_missing_presence_blocking, missing)
+        for email, state in fetched.items():
+            presence_state[email] = state
+            result[email] = {
+                "is_online": state.get("is_online", False),
+                "last_seen_at": state.get("last_seen_at"),
+            }
+
+    return result
 
 @app.get("/")
 @app.head("/")
