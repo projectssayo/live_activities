@@ -1,10 +1,12 @@
 import asyncio
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pymongo import MongoClient, ReturnDocument
+from pymongo import MongoClient
 
 
 MONGO_USERNAME = "suyognegi_global"
@@ -39,12 +41,10 @@ HEARTBEAT_IDLE_TIMEOUT = 2.0
 HEARTBEAT_PING_TIMEOUT = 1.0
 
 # ---------------------------------------------------------------------
-# NEW: everything the hot (broadcast) path needs lives in memory.
-# pymongo is a *blocking* driver -- calling it directly inside an async
-# def freezes the single-threaded event loop, which stalls delivery to
-# EVERY connected socket, not just the two users involved in that one
-# event. These two structures are the fix: they let connect/disconnect/
-# chat events be handled with zero Mongo round trips on the hot path.
+# In-memory state. Everything on the hot path reads/writes these --
+# zero blocking Mongo calls in the request/event path. Mongo writes are
+# fire-and-forget (asyncio.create_task) and Mongo reads only happen at
+# startup or as a cache-miss fallback.
 # ---------------------------------------------------------------------
 
 # email -> {"is_online": bool, "last_seen_at": iso_str|None, "user_is_on": str|None}
@@ -54,7 +54,15 @@ presence_state: Dict[str, dict] = {}
 # "who needs to be told when this email's presence changes"
 friend_watchers: Dict[str, Set[str]] = {}
 
-# All Mongo calls run here so they never block the event loop.
+# email -> the set of friend emails currently in THAT email's friend_list
+# (needed so the friend_list change-stream handler can diff old vs new)
+user_friend_lists: Dict[str, Set[str]] = {}
+
+# the running asyncio loop, captured at startup so the background watcher
+# threads (which are NOT asyncio, see below) can hand work back to it
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+# All one-shot/blocking Mongo calls run here so they never block the loop.
 EXECUTOR = ThreadPoolExecutor(max_workers=8)
 
 
@@ -81,7 +89,8 @@ LEGACY_PRESENCE_FIELDS = {"online": "", "last_seen": ""}
 
 
 # ---------------------------------------------------------------------
-# blocking Mongo functions -- ONLY ever called via run_blocking()
+# blocking Mongo functions -- ONLY ever called via run_blocking() or
+# from inside the dedicated watcher threads below (never on the loop)
 # ---------------------------------------------------------------------
 
 def _strip_legacy_presence_fields_blocking():
@@ -163,14 +172,20 @@ def _load_missing_presence_blocking(emails: List[str]) -> Dict[str, dict]:
     return result
 
 
-def _build_friend_watchers_blocking() -> Dict[str, Set[str]]:
-    """For every user doc, invert friend_list into 'who watches whom'."""
-    index: Dict[str, Set[str]] = {}
+def _build_friend_watchers_and_lists_blocking():
+    """For every user doc in all_type_list_table, invert friend_list into
+    'who watches whom' (friend_watchers) and also snapshot each user's own
+    friend_list (user_friend_lists) so the change-stream handler can diff
+    old vs new the next time that array changes."""
+    watchers: Dict[str, Set[str]] = {}
+    lists: Dict[str, Set[str]] = {}
     for doc in all_type_list_col.find({}, {"friend_list": 1}):
-        watcher = doc["_id"]
-        for friend_email in doc.get("friend_list", []):
-            index.setdefault(friend_email, set()).add(watcher)
-    return index
+        user_email = doc["_id"]
+        friends = set(doc.get("friend_list", []))
+        lists[user_email] = friends
+        for friend_email in friends:
+            watchers.setdefault(friend_email, set()).add(user_email)
+    return watchers, lists
 
 
 def _get_status_blocking(me: str, friend: str) -> dict:
@@ -191,44 +206,6 @@ def _get_status_blocking(me: str, friend: str) -> dict:
 
 
 # ---------------------------------------------------------------------
-# startup: warm the in-memory caches, then keep the friend graph fresh
-# ---------------------------------------------------------------------
-
-@app.on_event("startup")
-async def startup_event():
-    await run_blocking(_strip_legacy_presence_fields_blocking)
-    await run_blocking(_create_friend_list_index_blocking)
-
-    global presence_state, friend_watchers
-    presence_state = await run_blocking(_load_all_presence_blocking)
-    friend_watchers = await run_blocking(_build_friend_watchers_blocking)
-
-    asyncio.create_task(_periodic_friend_graph_refresh())
-
-
-async def _periodic_friend_graph_refresh():
-    """friend_watchers is only rebuilt from Mongo periodically (adding a
-    friend doesn't push a live update to this server). 20s keeps 'new
-    friend added' -> 'live presence starts flowing' lag small without
-    hammering Mongo. Call POST /refresh_friend_graph for an instant
-    rebuild right after your app's add-friend flow completes."""
-    global friend_watchers
-    while True:
-        await asyncio.sleep(20)
-        try:
-            friend_watchers = await run_blocking(_build_friend_watchers_blocking)
-        except Exception:
-            pass
-
-
-@app.post("/refresh_friend_graph")
-async def refresh_friend_graph():
-    global friend_watchers
-    friend_watchers = await run_blocking(_build_friend_watchers_blocking)
-    return {"ok": True, "tracked_emails": len(friend_watchers)}
-
-
-# ---------------------------------------------------------------------
 # fast, non-blocking helpers used on the hot path
 # ---------------------------------------------------------------------
 
@@ -242,20 +219,16 @@ async def safe_send(ws: Optional[WebSocket], payload: dict) -> None:
 
 
 async def broadcast_presence_to_friends(changed_email: str) -> None:
+    """O(1) index lookup + concurrent fan-out, zero Mongo calls."""
     watchers = friend_watchers.get(changed_email)
     if not watchers:
         return
-    new_state = presence_state.get(changed_email, {})
-    payload = {"type": "presence_update", "email": changed_email, **new_state}
-
-    # debug: what changed and who's getting told
-    print(f"[presence] {changed_email} -> {new_state} | notifying {len(watchers & connected_users.keys())} watchers")
-
+    payload = {"type": "presence_update", "email": changed_email, **presence_state.get(changed_email, {})}
     await asyncio.gather(
         *(safe_send(connected_users.get(w), payload) for w in watchers if w in connected_users),
         return_exceptions=True,
     )
-    
+
 
 async def notify_peer(peer_email: str, changed_email: str) -> None:
     payload = {"type": "presence_update", "email": changed_email, **presence_state.get(changed_email, {})}
@@ -265,8 +238,7 @@ async def notify_peer(peer_email: str, changed_email: str) -> None:
 async def send_bulk_presence(requester_email: str, friend_emails: List[str]) -> None:
     """Served straight from presence_state -- no Mongo round trip in the
     common case. Only falls back to Mongo for emails we've genuinely
-    never seen (e.g. a friend who hasn't connected since this process
-    started), and caches the result for next time."""
+    never seen, and caches the result for next time."""
     ws = connected_users.get(requester_email)
     if ws is None or not friend_emails:
         return
@@ -286,6 +258,7 @@ async def send_bulk_presence(requester_email: str, friend_emails: List[str]) -> 
             presence_state[email] = state
             updates.append({"email": email, **state})
 
+    print(f"[bulk_presence] -> {requester_email}: {len(updates)} entries ({len(missing)} fetched from mongo)")
     await safe_send(ws, {"type": "bulk_presence", "updates": updates})
 
 
@@ -308,11 +281,13 @@ async def mark_user_online(email: str) -> None:
 
 async def mark_user_offline(email: str) -> None:
     ts = now_utc()
+    prev = presence_state.get(email, {})
     presence_state[email] = {
         "is_online": False,
         "last_seen_at": ts.isoformat(),
         "user_is_on": None,
     }
+    print(f"[presence] {email}: {prev} -> {presence_state[email]}")
     asyncio.create_task(run_blocking(_persist_user_offline_blocking, email, ts))
 
 
@@ -328,7 +303,7 @@ async def touch_last_clicked(email: str, target_email: str) -> None:
 
 
 # ---------------------------------------------------------------------
-# event handling
+# websocket event handling (client -> server messages)
 # ---------------------------------------------------------------------
 
 async def handle_event(email: str, data: dict) -> None:
@@ -369,6 +344,131 @@ async def cleanup_user(email: str) -> None:
         await notify_peer(target_email, email)
 
     await broadcast_presence_to_friends(email)
+
+
+# ---------------------------------------------------------------------
+# Mongo change streams -- these are what make everything automatic.
+# .watch() is a BLOCKING generator, so each of these runs in its own
+# daemon thread (never on the asyncio loop) and hands results back to
+# the loop via asyncio.run_coroutine_threadsafe. Requires the Mongo
+# deployment to be a replica set (Atlas clusters satisfy this).
+# ---------------------------------------------------------------------
+
+def _watch_last_seen_changes():
+    """Watches db.last_seen for ANY change to ANY document. On a change,
+    diffs the incoming doc against what we have cached in presence_state,
+    prints the diff, updates the cache, and broadcasts to that email's
+    friend_watchers -- all without the client ever polling."""
+    while True:
+        try:
+            print("[last_seen watcher] change stream connected")
+            with last_seen_col.watch(full_document="updateLookup") as stream:
+                for change in stream:
+                    email = change["documentKey"]["_id"]
+                    full_doc = change.get("fullDocument")
+                    if not full_doc:
+                        continue
+
+                    last_seen_at = full_doc.get("last_seen_at")
+                    new_state = {
+                        "is_online": full_doc.get("is_online", False),
+                        "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+                        "user_is_on": full_doc.get("user_is_on"),
+                    }
+                    old_state = presence_state.get(email)
+
+                    if old_state == new_state:
+                        continue  # no real change, e.g. a re-set of the same values
+
+                    print(f"[last_seen CHANGED] {email}: {old_state} -> {new_state}")
+                    presence_state[email] = new_state
+
+                    if MAIN_LOOP is not None:
+                        asyncio.run_coroutine_threadsafe(
+                            broadcast_presence_to_friends(email), MAIN_LOOP
+                        )
+        except Exception as e:
+            print(f"[last_seen watcher] stream error, retrying in 3s: {e}")
+            time.sleep(3)
+
+
+def _watch_friend_list_changes():
+    """Watches user_db.all_type_list_table for ANY change to ANY document.
+    On a change, diffs friend_list against our cached copy for that user.
+    New friends are wired into friend_watchers immediately (so presence
+    starts flowing right away) and, if that user is currently connected,
+    we push them the new friend's current status right now via
+    bulk_presence -- no waiting on the client to ask."""
+    while True:
+        try:
+            print("[friend_list watcher] change stream connected")
+            with all_type_list_col.watch(full_document="updateLookup") as stream:
+                for change in stream:
+                    user_email = change["documentKey"]["_id"]
+                    full_doc = change.get("fullDocument")
+                    if not full_doc:
+                        continue
+
+                    new_friends = set(full_doc.get("friend_list", []))
+                    old_friends = user_friend_lists.get(user_email, set())
+
+                    if new_friends == old_friends:
+                        continue
+
+                    added = new_friends - old_friends
+                    removed = old_friends - new_friends
+                    print(f"[friend_list CHANGED] {user_email}: +{added} -{removed}")
+
+                    user_friend_lists[user_email] = new_friends
+
+                    for friend_email in added:
+                        friend_watchers.setdefault(friend_email, set()).add(user_email)
+                    for friend_email in removed:
+                        watchers = friend_watchers.get(friend_email)
+                        if watchers:
+                            watchers.discard(user_email)
+
+                    if added and MAIN_LOOP is not None:
+                        asyncio.run_coroutine_threadsafe(
+                            send_bulk_presence(user_email, list(added)), MAIN_LOOP
+                        )
+        except Exception as e:
+            print(f"[friend_list watcher] stream error, retrying in 3s: {e}")
+            time.sleep(3)
+
+
+# ---------------------------------------------------------------------
+# startup: warm the in-memory caches, then start the change-stream
+# watcher threads. No polling timers left anywhere.
+# ---------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    global MAIN_LOOP, presence_state, friend_watchers, user_friend_lists
+
+    MAIN_LOOP = asyncio.get_event_loop()
+
+    await run_blocking(_strip_legacy_presence_fields_blocking)
+    await run_blocking(_create_friend_list_index_blocking)
+
+    presence_state = await run_blocking(_load_all_presence_blocking)
+    friend_watchers, user_friend_lists = await run_blocking(_build_friend_watchers_and_lists_blocking)
+
+    threading.Thread(target=_watch_last_seen_changes, daemon=True, name="last_seen-watcher").start()
+    threading.Thread(target=_watch_friend_list_changes, daemon=True, name="friend_list-watcher").start()
+
+    print(f"[startup] warmed presence_state({len(presence_state)}) "
+          f"friend_watchers({len(friend_watchers)}) user_friend_lists({len(user_friend_lists)})")
+
+
+@app.post("/refresh_friend_graph")
+async def refresh_friend_graph():
+    """Manual escape hatch -- not needed in normal operation since the
+    change stream keeps friend_watchers live, but handy if you ever
+    suspect drift (e.g. after a stream reconnect gap)."""
+    global friend_watchers, user_friend_lists
+    friend_watchers, user_friend_lists = await run_blocking(_build_friend_watchers_and_lists_blocking)
+    return {"ok": True, "tracked_emails": len(friend_watchers)}
 
 
 @app.websocket("/ws/{email}/{mac_id}")
@@ -421,23 +521,10 @@ def root():
 
 @app.get("/status")
 async def get_status(me: str, friend: str):
+    """Kept only as a manual debug endpoint. Not called by the client
+    anymore -- bulk_presence at connect + presence_update pushes cover
+    the live case."""
     return await run_blocking(_get_status_blocking, me, friend)
-
-
-@app.get("/friends_last_seen")
-def friends_last_seen(emails: str):
-    """Kept as a REST fallback for the client's periodic LastSeenSyncThread
-    safety-net reconciliation. The live path is now the websocket
-    sync_request/bulk_presence flow above, served from presence_state."""
-    email_list = [e.strip() for e in emails.split(",") if e.strip()]
-    if not email_list:
-        return {}
-    result = {}
-    for email in email_list:
-        state = presence_state.get(email)
-        if state is not None:
-            result[email] = {"is_online": state["is_online"], "last_seen_at": state["last_seen_at"]}
-    return result
 
 
 @app.get("/check_mac/{email}")
@@ -448,4 +535,9 @@ async def check_mac(email: str, mac_id: str):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "tracked_users": len(presence_state), "connected": len(connected_users)}
+    return {
+        "ok": True,
+        "tracked_users": len(presence_state),
+        "connected": len(connected_users),
+        "tracked_friend_graph_entries": len(friend_watchers),
+    }
