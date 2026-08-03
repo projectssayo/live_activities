@@ -242,16 +242,20 @@ async def safe_send(ws: Optional[WebSocket], payload: dict) -> None:
 
 
 async def broadcast_presence_to_friends(changed_email: str) -> None:
-    """O(1) index lookup + concurrent fan-out, zero Mongo calls."""
     watchers = friend_watchers.get(changed_email)
     if not watchers:
         return
-    payload = {"type": "presence_update", "email": changed_email, **presence_state.get(changed_email, {})}
+    new_state = presence_state.get(changed_email, {})
+    payload = {"type": "presence_update", "email": changed_email, **new_state}
+
+    # debug: what changed and who's getting told
+    print(f"[presence] {changed_email} -> {new_state} | notifying {len(watchers & connected_users.keys())} watchers")
+
     await asyncio.gather(
         *(safe_send(connected_users.get(w), payload) for w in watchers if w in connected_users),
         return_exceptions=True,
     )
-
+    
 
 async def notify_peer(peer_email: str, changed_email: str) -> None:
     payload = {"type": "presence_update", "email": changed_email, **presence_state.get(changed_email, {})}
@@ -298,6 +302,7 @@ async def mark_user_online(email: str) -> None:
         "last_seen_at": ts.isoformat(),
         "user_is_on": prev.get("user_is_on"),
     }
+    print(f"[presence] {email}: {prev} -> {presence_state[email]}")
     asyncio.create_task(run_blocking(_persist_user_online_blocking, email, ts))
 
 
