@@ -66,9 +66,16 @@ MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 EXECUTOR = ThreadPoolExecutor(max_workers=8)
 
 
-def run_blocking(fn, *args, **kwargs):
+async def run_blocking(fn, *args, **kwargs):
+    """Must be `async def`, not a plain function returning the executor
+    Future directly -- asyncio.create_task() requires an actual coroutine
+    object. run_in_executor() returns a Future, which create_task rejected
+    outright on newer Python/uvloop ("a coroutine was expected, got
+    <Future...>"). Awaiting it here makes run_blocking(...) itself produce
+    a coroutine, so every `asyncio.create_task(run_blocking(...))`
+    fire-and-forget call below works again."""
     loop = asyncio.get_event_loop()
-    return loop.run_in_executor(EXECUTOR, lambda: fn(*args, **kwargs))
+    return await loop.run_in_executor(EXECUTOR, lambda: fn(*args, **kwargs))
 
 
 def sanitize_email(email: str) -> str:
