@@ -37,8 +37,8 @@ app = FastAPI(title="Zyro Live Activity Service")
 connected_users: Dict[str, WebSocket] = {}
 socket_mac: Dict[str, str] = {}
 
-HEARTBEAT_IDLE_TIMEOUT = 2.0
-HEARTBEAT_PING_TIMEOUT = 1.0
+HEARTBEAT_IDLE_TIMEOUT =5.0
+HEARTBEAT_PING_TIMEOUT =3.0
 
 # ---------------------------------------------------------------------
 # In-memory state. Everything on the hot path reads/writes these --
