@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 
 
 MONGO_USERNAME = "suyognegi_global"
@@ -142,6 +142,43 @@ def _persist_last_clicked_blocking(email: str, target_email: str, ts: datetime):
         {"_id": chat_id, other_field: {"$exists": False}},
         {"$set": {other_field: None}},
     )
+
+
+def _push_last_clicked_batch_blocking(entries: List[dict]) -> List[str]:
+    """
+    Batched write-through target for the client's LastClickedManager.
+    entries: [{"chat_id": str, "updates": {sanitized_field: iso_str|None, ...}}, ...]
+
+    One bulk_write round trip to Mongo covers the entire batch, no matter
+    how many chats or how many offline clicks are queued up client-side.
+    Returns the chat_ids actually included, so the caller can ack exactly
+    those back to the client.
+    """
+    ops = []
+    chat_ids = []
+    for entry in entries:
+        chat_id = entry.get("chat_id")
+        updates = entry.get("updates") or {}
+        if not chat_id or not updates:
+            continue
+
+        parsed = {}
+        for field, value in updates.items():
+            if value:
+                try:
+                    parsed[field] = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except Exception:
+                    parsed[field] = None
+            else:
+                parsed[field] = None
+
+        ops.append(UpdateOne({"_id": chat_id}, {"$set": parsed}, upsert=True))
+        chat_ids.append(chat_id)
+
+    if ops:
+        last_clicked_col.bulk_write(ops, ordered=False)
+
+    return chat_ids
 
 
 def _record_login_blocking(email: str, mac_id: str, ts: datetime):
@@ -334,6 +371,20 @@ async def handle_event(email: str, data: dict) -> None:
     elif event_type == "sync_request":
         friend_emails = data.get("friend_list") or []
         await send_bulk_presence(email, friend_emails)
+
+    elif event_type == "sync_last_clicked":
+        # Batched write-through from the client's local sqlite queue --
+        # covers offline clicks, clicks made under a previous login on
+        # this machine, and anything the write-through push missed.
+        # One message in, one bulk_write to Mongo, one ack back out.
+        entries = data.get("entries") or []
+        if not entries:
+            return
+        synced_chat_ids = await run_blocking(_push_last_clicked_batch_blocking, entries)
+        await safe_send(connected_users.get(email), {
+            "type": "sync_last_clicked_ack",
+            "chat_ids": synced_chat_ids,
+        })
 
 
 async def cleanup_user(email: str) -> None:
