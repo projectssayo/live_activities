@@ -670,3 +670,21 @@ def health():
         "connected": len(connected_users),
         "tracked_friend_graph_entries": len(friend_watchers),
     }
+@app.get("/get_scheduled_messages")
+async def get_scheduled_messages(from_user: str):
+    """Called once on client startup (and retried by the client until it
+    succeeds at least once) to pull every scheduled message belonging to
+    from_user, so the local cache can be rebuilt even after being offline
+    since the last sync."""
+    try:
+        def do_read():
+            docs = list(messages_to_send_col.find({"from": from_user}))
+            for d in docs:
+                d["_id"] = str(d["_id"])
+            return docs
+
+        docs = await run_blocking(do_read)
+        return {"ok": True, "messages": docs}
+    except Exception as e:
+        print(f"[get_scheduled_messages] error: {e}")
+        return {"ok": False, "error": str(e), "messages": []}
