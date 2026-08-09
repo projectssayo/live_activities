@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from pymongo import MongoClient, UpdateOne
 
 
@@ -31,6 +31,9 @@ logged_in_col = db["logged_in_at"]
 
 user_db = client["user_db"]
 all_type_list_col = user_db["all_type_list_table"]
+
+scheduled_msg_db = client["scheduled_messages"]
+messages_to_send_col = scheduled_msg_db["messages_to_send"]
 
 app = FastAPI(title="Zyro Live Activity Service")
 
@@ -527,6 +530,43 @@ async def refresh_friend_graph():
     global friend_watchers, user_friend_lists
     friend_watchers, user_friend_lists = await run_blocking(_build_friend_watchers_and_lists_blocking)
     return {"ok": True, "tracked_emails": len(friend_watchers)}
+
+
+@app.post("/push_scheduled_message")
+async def push_scheduled_message(request: Request):
+    """Client's ScheduleSyncThread posts here for every row sitting in
+    its local unsent_schedule_messages table. operation is one of
+    'send' / 'edit' / 'delete'. The write logic is a closure so nothing
+    new is added to the module's global function namespace."""
+    try:
+        payload = await request.json()
+
+        def do_write():
+            op = payload.get("operation")
+            _id = payload.get("_id")
+
+            if op == "delete":
+                messages_to_send_col.delete_one({"_id": _id})
+                return True
+
+            doc = {
+                "_id": _id,
+                "scheduled_at": payload.get("scheduled_at"),
+                "from": payload.get("from"),
+                "to": payload.get("to"),
+                "sent": payload.get("sent"),
+                "sent_at": payload.get("sent_at"),
+                "message_type": payload.get("message_type"),
+                "message_content": payload.get("message_content"),
+            }
+            messages_to_send_col.update_one({"_id": _id}, {"$set": doc}, upsert=True)
+            return True
+
+        ok = await run_blocking(do_write)
+        return {"ok": ok}
+    except Exception as e:
+        print(f"[push_scheduled_message] error: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 @app.websocket("/ws/{email}/{mac_id}")
