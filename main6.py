@@ -688,3 +688,54 @@ async def get_scheduled_messages(from_user: str):
     except Exception as e:
         print(f"[get_scheduled_messages] error: {e}")
         return {"ok": False, "error": str(e), "messages": []}
+
+
+
+
+# fastapi_app.py (add to your existing app)
+import cloudinary
+import cloudinary.uploader
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from pydantic import BaseModel
+
+cloudinary.config(
+    cloud_name='dbiifyr5m',
+    api_key='931832746959244',
+    api_secret='W4-z0i5yUemucfL_uBPTFoDgH00',
+    secure=True
+)
+
+
+
+@app.post("/upload_scheduled_image")
+async def upload_scheduled_image(widget_id: str = Form(...), file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        result = cloudinary.uploader.upload(
+            contents,
+            public_id=widget_id,
+            folder="scheduled_msgs",
+            overwrite=True,
+            resource_type="image"
+        )
+        return {
+            "ok": True,
+            "public_id": result.get("public_id"),
+            "url": result.get("secure_url")
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class DeleteImageRequest(BaseModel):
+    public_id: str
+
+
+@app.post("/delete_scheduled_image")
+async def delete_scheduled_image(req: DeleteImageRequest):
+    try:
+        result = cloudinary.uploader.destroy(req.public_id, resource_type="image")
+        # result looks like {'result': 'ok'} or {'result': 'not found'}
+        return {"ok": True, "result": result.get("result")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
