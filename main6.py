@@ -8,7 +8,17 @@ from typing import Dict, List, Optional, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from pymongo import MongoClient, UpdateOne
 
+import cloudinary
+import cloudinary.uploader
+from fastapi import UploadFile, File, Form
+from pydantic import BaseModel
 
+cloudinary.config(
+    cloud_name='dbiifyr5m',
+    api_key='931832746959244',
+    api_secret='W4-z0i5yUemucfL_uBPTFoDgH00',
+    secure=True
+)
 MONGO_USERNAME = "suyognegi_global"
 MONGO_PASSWORD = "Oj5eGphIUUud9YvY"
 
@@ -67,7 +77,27 @@ MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # All one-shot/blocking Mongo calls run here so they never block the loop.
 EXECUTOR = ThreadPoolExecutor(max_workers=8)
+def do_write():
+    op = payload.get("operation")
+    _id = payload.get("_id")
 
+    if op == "delete":
+        messages_to_send_col.delete_one({"_id": _id})
+        return True
+
+    doc = {
+        "_id": _id,
+        "scheduled_at": payload.get("scheduled_at"),
+        "from": payload.get("from"),
+        "to": payload.get("to"),
+        "sent": payload.get("sent"),
+        "sent_at": payload.get("sent_at"),
+        "message_type": payload.get("message_type"),
+        "message_content": payload.get("message_content"),
+        "cloud_public_id": payload.get("cloud_public_id"),   # <-- ADD
+    }
+    messages_to_send_col.update_one({"_id": _id}, {"$set": doc}, upsert=True)
+    return True
 
 async def run_blocking(fn, *args, **kwargs):
     """Must be `async def`, not a plain function returning the executor
@@ -691,19 +721,6 @@ async def get_scheduled_messages(from_user: str):
 
 
 
-
-# fastapi_app.py (add to your existing app)
-import cloudinary
-import cloudinary.uploader
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
-
-cloudinary.config(
-    cloud_name='dbiifyr5m',
-    api_key='931832746959244',
-    api_secret='W4-z0i5yUemucfL_uBPTFoDgH00',
-    secure=True
-)
 
 
 
