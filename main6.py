@@ -578,17 +578,18 @@ async def push_scheduled_message(request: Request):
             if op == "delete":
                 messages_to_send_col.delete_one({"_id": _id})
                 return True
-
+        
             doc = {
-                "_id": _id,
-                "scheduled_at": payload.get("scheduled_at"),
-                "from": payload.get("from"),
-                "to": payload.get("to"),
-                "sent": payload.get("sent"),
-                "sent_at": payload.get("sent_at"),
-                "message_type": payload.get("message_type"),
-                "message_content": payload.get("message_content"),
-            }
+            "_id": _id,
+            "scheduled_at": payload.get("scheduled_at"),
+            "from": payload.get("from"),
+            "to": payload.get("to"),
+            "sent": payload.get("sent"),
+            "sent_at": payload.get("sent_at"),
+            "message_type": payload.get("message_type"),
+            "message_content": payload.get("message_content"),
+            "cloud_public_id": payload.get("cloud_public_id"),
+        }
             messages_to_send_col.update_one({"_id": _id}, {"$set": doc}, upsert=True)
             return True
 
@@ -724,6 +725,8 @@ async def get_scheduled_messages(from_user: str):
 
 
 
+
+
 @app.post("/upload_scheduled_image")
 async def upload_scheduled_image(widget_id: str = Form(...), file: UploadFile = File(...)):
     try:
@@ -735,11 +738,7 @@ async def upload_scheduled_image(widget_id: str = Form(...), file: UploadFile = 
             overwrite=True,
             resource_type="image"
         )
-        return {
-            "ok": True,
-            "public_id": result.get("public_id"),
-            "url": result.get("secure_url")
-        }
+        return {"ok": True, "public_id": result.get("public_id"), "url": result.get("secure_url")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -752,7 +751,6 @@ class DeleteImageRequest(BaseModel):
 async def delete_scheduled_image(req: DeleteImageRequest):
     try:
         result = cloudinary.uploader.destroy(req.public_id, resource_type="image")
-        # result looks like {'result': 'ok'} or {'result': 'not found'}
         return {"ok": True, "result": result.get("result")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
