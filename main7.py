@@ -38,7 +38,8 @@ db = client["live_activities"]
 last_seen_col = db["last_seen"]
 last_clicked_col = db["last_clicked_on_table"]
 logged_in_col = db["logged_in_at"]
-
+messages_col = db["messages"]
+messages_col.create_index([("sent_by", 1), ("sent_to", 1), ("sent_at", -1)])
 user_db = client["user_db"]
 all_type_list_col = user_db["all_type_list_table"]
 
@@ -74,7 +75,29 @@ user_friend_lists: Dict[str, Set[str]] = {}
 # the running asyncio loop, captured at startup so the background watcher
 # threads (which are NOT asyncio, see below) can hand work back to it
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+def _save_message_blocking(msg: dict):
+    messages_col.update_one({"_id": msg["_id"]}, {"$set": msg}, upsert=True)
+    return True
 
+def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit: int = 10):
+    query = {"$or": [
+        {"sent_by": user_a, "sent_to": user_b},
+        {"sent_by": user_b, "sent_to": user_a},
+    ]}
+    if before_sent_at:
+        query["sent_at"] = {"$lt": before_sent_at}
+    docs = list(messages_col.find(query).sort("sent_at", -1).limit(limit))
+    docs.reverse()
+    return docs
+
+def _mark_deleted_for_all_blocking(msg_id: str):
+    messages_col.update_one({"_id": msg_id}, {"$set": {"delete_from_all": True}})
+
+def _mark_deleted_for_me_blocking(msg_id: str, who: str):
+    messages_col.update_one({"_id": msg_id}, {"$addToSet": {"deleted_for": who}})
+
+def _edit_message_blocking(msg_id: str, new_content: str):
+    messages_col.update_one({"_id": msg_id}, {"$set": {"msg_content": new_content, "is_edited": True}})
 # All one-shot/blocking Mongo calls run here so they never block the loop.
 EXECUTOR = ThreadPoolExecutor(max_workers=8)
 def do_write():
@@ -599,6 +622,84 @@ async def push_scheduled_message(request: Request):
         print(f"[push_scheduled_message] error: {e}")
         return {"ok": False, "error": str(e)}
 
+
+class MessagePayload(BaseModel):
+    _id: str
+    msg_type: str
+    msg_content: str
+    is_edited: bool = False
+    sent_by: str
+    sent_to: str
+    sent_at: str
+    delete_from_me: bool = False
+    delete_from_all: bool = False
+    thumbnail_url: Optional[str] = None
+
+
+@app.post("/send_message")
+async def send_message(payload: MessagePayload):
+    msg = payload.dict()
+    await run_blocking(_save_message_blocking, msg)
+    peer_ws = connected_users.get(msg["sent_to"])
+    if peer_ws is not None:
+        await safe_send(peer_ws, {"type": "new_message", "message": msg})
+    return {"ok": True}
+
+
+@app.get("/get_messages_page")
+async def get_messages_page(user_a: str, user_b: str, before_sent_at: Optional[str] = None, limit: int = 10):
+    docs = await run_blocking(_get_messages_page_blocking, user_a, user_b, before_sent_at, limit)
+    return {"ok": True, "messages": docs, "has_more": len(docs) == limit}
+
+
+@app.post("/mark_delete_for_all/{msg_id}")
+async def mark_delete_for_all(msg_id: str, request: Request):
+    body = await request.json()
+    await run_blocking(_mark_deleted_for_all_blocking, msg_id)
+    peer = body.get("notify_email")
+    if peer and peer in connected_users:
+        await safe_send(connected_users[peer], {"type": "message_deleted_all", "_id": msg_id})
+    return {"ok": True}
+
+
+@app.post("/mark_delete_for_me/{msg_id}")
+async def mark_delete_for_me(msg_id: str, request: Request):
+    body = await request.json()
+    await run_blocking(_mark_deleted_for_me_blocking, msg_id, body.get("who"))
+    return {"ok": True}
+
+
+@app.post("/edit_message/{msg_id}")
+async def edit_message(msg_id: str, request: Request):
+    body = await request.json()
+    await run_blocking(_edit_message_blocking, msg_id, body.get("msg_content"))
+    peer = body.get("notify_email")
+    if peer and peer in connected_users:
+        await safe_send(connected_users[peer], {"type": "message_edited", "_id": msg_id, "msg_content": body.get("msg_content")})
+    return {"ok": True}
+
+
+@app.post("/upload_chat_image")
+async def upload_chat_image(msg_id: str = Form(...), file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+
+        def do_upload():
+            full = cloudinary.uploader.upload(
+                contents, public_id=f"{msg_id}_full", folder="chat_images",
+                overwrite=True, resource_type="image"
+            )
+            thumb = cloudinary.uploader.upload(
+                contents, public_id=f"{msg_id}_thumb", folder="chat_images",
+                overwrite=True, resource_type="image",
+                transformation=[{"width": 300, "quality": "auto:low", "crop": "limit"}]
+            )
+            return full, thumb
+
+        full, thumb = await run_blocking(do_upload)
+        return {"ok": True, "url": full.get("secure_url"), "thumbnail_url": thumb.get("secure_url")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.websocket("/ws/{email}/{mac_id}")
 async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
