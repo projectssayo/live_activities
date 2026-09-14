@@ -697,7 +697,7 @@ async def upload_chat_image(msg_id: str = Form(...), file: UploadFile = File(...
             thumb = cloudinary.uploader.upload(
                 contents, public_id=f"{msg_id}_thumb", folder="chat_images",
                 overwrite=True, resource_type="image",
-                transformation=[{"width": 300, "quality": "auto:low", "crop": "limit"}]
+                transformation=[{"width": 500, "quality": "auto:good", "crop": "limit"}]
             )
             return full, thumb
 
@@ -705,7 +705,11 @@ async def upload_chat_image(msg_id: str = Form(...), file: UploadFile = File(...
         return {"ok": True, "url": full.get("secure_url"), "thumbnail_url": thumb.get("secure_url")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
+        
+        
+        
+        
+        
 @app.websocket("/ws/{email}/{mac_id}")
 async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
     await websocket.accept()
