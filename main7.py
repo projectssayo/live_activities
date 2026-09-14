@@ -623,8 +623,10 @@ async def push_scheduled_message(request: Request):
         return {"ok": False, "error": str(e)}
 
 
+from pydantic import Field
+
 class MessagePayload(BaseModel):
-    _id: str
+    id: str = Field(..., alias="_id")
     msg_type: str
     msg_content: str
     is_edited: bool = False
@@ -635,15 +637,18 @@ class MessagePayload(BaseModel):
     delete_from_all: bool = False
     thumbnail_url: Optional[str] = None
 
+    class Config:
+        allow_population_by_field_name = True
 
 @app.post("/send_message")
 async def send_message(payload: MessagePayload):
-    msg = payload.dict()
+    msg = payload.dict(by_alias=True)
     await run_blocking(_save_message_blocking, msg)
     peer_ws = connected_users.get(msg["sent_to"])
     if peer_ws is not None:
         await safe_send(peer_ws, {"type": "new_message", "message": msg})
     return {"ok": True}
+
 
 
 @app.get("/get_messages_page")
