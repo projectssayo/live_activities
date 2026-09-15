@@ -636,9 +636,13 @@ class MessagePayload(BaseModel):
     delete_from_me: bool = False
     delete_from_all: bool = False
     thumbnail_url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
 
     class Config:
         allow_population_by_field_name = True
+
+
 
 @app.post("/send_message")
 async def send_message(payload: MessagePayload):
@@ -697,10 +701,11 @@ async def upload_chat_image(msg_id: str = Form(...), file: UploadFile = File(...
             thumb = cloudinary.uploader.upload(
                 contents, public_id=f"{msg_id}_thumb", folder="chat_images",
                 overwrite=True, resource_type="image",
-                transformation=[{"width": 500, "quality": "auto:good", "crop": "limit"}]
+                transformation=[{"width": 1200, "quality": "auto:good", "crop": "limit"}]
             )
             return full, thumb
 
+        
         full, thumb = await run_blocking(do_upload)
         return {"ok": True, "url": full.get("secure_url"), "thumbnail_url": thumb.get("secure_url")}
     except Exception as e:
