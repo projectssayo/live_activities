@@ -644,6 +644,7 @@ class MessagePayload(BaseModel):
 
 
 
+
 @app.post("/send_message")
 async def send_message(payload: MessagePayload):
     msg = payload.dict(by_alias=True)
@@ -688,6 +689,8 @@ async def edit_message(msg_id: str, request: Request):
     return {"ok": True}
 
 
+
+
 @app.post("/upload_chat_image")
 async def upload_chat_image(msg_id: str = Form(...), file: UploadFile = File(...)):
     try:
@@ -705,13 +708,12 @@ async def upload_chat_image(msg_id: str = Form(...), file: UploadFile = File(...
             )
             return full, thumb
 
-        
         full, thumb = await run_blocking(do_upload)
         return {"ok": True, "url": full.get("secure_url"), "thumbnail_url": thumb.get("secure_url")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-        
-        
+
+
         
         
         
