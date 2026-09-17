@@ -871,3 +871,72 @@ async def delete_scheduled_image(req: DeleteImageRequest):
         return {"ok": True, "result": result.get("result")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+chat_previews_col = db["chat_previews"]
+chat_previews_col.create_index("last_msg_sent_at")
+
+
+def get_local_chat_id(email_a: str, email_b: str) -> str:
+    return f"chat_{min(email_a, email_b)}_{max(email_a, email_b)}"
+
+def _sync_chat_preview_blocking(chat_id: str, incoming: dict) -> dict:
+    """Compare-and-swap on last_msg_sent_at: only overwrite when the
+    incoming preview is strictly newer than what's stored. Always returns
+    the winning doc so the caller can hand it straight back to the client."""
+    incoming_ts = incoming.get("last_msg_sent_at")
+    existing = chat_previews_col.find_one({"_id": chat_id})
+
+    if existing is None or (incoming_ts and incoming_ts > (existing.get("last_msg_sent_at") or "")):
+        doc = {**incoming, "_id": chat_id}
+        chat_previews_col.update_one({"_id": chat_id}, {"$set": doc}, upsert=True)
+        return doc
+
+    return existing
+
+
+def _get_chat_previews_blocking(me: str, friend_list: list) -> dict:
+    """Returns {friend_email: preview_doc} for every chat this user shares
+    with the given friends. Keyed by friend email (not chat_id) so the
+    client can index it straight into its friend_list dict."""
+    chat_ids = {get_local_chat_id(me, f): f for f in friend_list}
+    docs = list(chat_previews_col.find({"_id": {"$in": list(chat_ids.keys())}}))
+    return {chat_ids[d["_id"]]: d for d in docs}
+
+
+class ChatPreviewPayload(BaseModel):
+    chat_id: str
+    last_msg_id: str
+    last_msg_sent_at: str
+    msg_type: str
+    msg_content: Optional[str] = None
+    sent_by: str
+    sent_to: str
+
+@app.post("/sync_chat_preview")
+async def sync_chat_preview(payload: ChatPreviewPayload):
+    """Client write-through for the friend-list row preview. The server
+    never blindly overwrites -- an older timestamp loses, and the winning
+    doc comes back so the client can adopt it if it was the loser."""
+    try:
+        winning = await run_blocking(_sync_chat_preview_blocking, payload.chat_id, payload.dict())
+        return {"ok": True, "preview": winning}
+    except Exception as e:
+        print(f"[sync_chat_preview] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/friends_chat_previews")
+async def friends_chat_previews(me: str, friends: str):
+    """One-shot reconciliation pull for the client's startup / reconnect
+    pass. friends is a comma-separated email list."""
+    try:
+        friend_list = [f for f in friends.split(",") if f]
+        if not friend_list:
+            return {"ok": True, "previews": {}}
+        previews = await run_blocking(_get_chat_previews_blocking, me, friend_list)
+        return {"ok": True, "previews": previews}
+    except Exception as e:
+        print(f"[friends_chat_previews] error: {e}")
+        return {"ok": False, "error": str(e), "previews": {}}
+
