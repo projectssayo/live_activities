@@ -657,7 +657,7 @@ async def send_message(payload: MessagePayload):
 
 
 @app.get("/get_messages_page")
-async def get_messages_page(user_a: str, user_b: str, before_sent_at: Optional[str] = None, limit: int = 10):
+async def get_messages_page(user_a: str, user_b: str, before_sent_at: Optional[str] = None, limit: int = 20):
     docs = await run_blocking(_get_messages_page_blocking, user_a, user_b, before_sent_at, limit)
     return {"ok": True, "messages": docs, "has_more": len(docs) == limit}
 
