@@ -663,3 +663,60 @@ async def delete_scheduled_image(req:DeleteImageRequest):
         return {"ok":True,"result":result.get("result")}
     except Exception as e:
         return {"ok":False,"error":str(e)}
+def _get_last_visible_message_blocking(user_a: str, user_b: str, viewer: str) -> Optional[dict]:
+    """Walks messages between user_a/user_b newest-first, skipping ones the viewer deleted for themselves."""
+    query = {"$or": [{"sent_by": user_a, "sent_to": user_b}, {"sent_by": user_b, "sent_to": user_a}]}
+    cursor = messages_col.find(query).sort("sent_at", -1)
+    for doc in cursor:
+        deleted_for = doc.get("deleted_for", []) or []
+        if viewer in deleted_for:
+            continue
+        return doc  # delete_from_all messages are fine to return, we just flag them below
+    return None
+
+
+def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional[dict]]:
+    friend_doc = all_type_list_col.find_one({"_id": user_email})
+    friend_list = friend_doc.get("friend_list", []) if friend_doc else []
+
+    result: Dict[str, Optional[dict]] = {}
+    for friend_email in friend_list:
+        msg = _get_last_visible_message_blocking(user_email, friend_email, user_email)
+        if msg is None:
+            result[friend_email] = None
+            continue
+
+        is_deleted_all = bool(msg.get("delete_from_all", False))
+        entry = {
+            "_id": msg.get("_id"),
+            "sent_by": msg.get("sent_by"),
+            "sent_to": msg.get("sent_to"),
+            "sent_at": msg.get("sent_at"),
+            "delete_from_all": is_deleted_all,
+        }
+
+        if is_deleted_all:
+            entry["msg_type"] = "delete_from_everyone"
+            entry["msg_content"] = None
+        else:
+            msg_type = msg.get("msg_type")
+            entry["msg_type"] = msg_type
+            if msg_type == "text":
+                content = msg.get("msg_content") or ""
+                entry["msg_content"] = content[:300]
+            else:
+                entry["msg_content"] = None  # non-text: caller only needs msg_type
+
+        result[friend_email] = entry
+
+    return result
+
+
+@app.get("/last_messages_preview")
+async def last_messages_preview(user_email: str):
+    try:
+        data = await run_blocking(_build_last_messages_preview_blocking, user_email)
+        return {"ok": True, "friend_list_last_messages": data}
+    except Exception as e:
+        print(f"[last_messages_preview] error: {e}")
+        return {"ok": False, "error": str(e), "friend_list_last_messages": {}}
