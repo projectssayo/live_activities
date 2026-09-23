@@ -13,7 +13,6 @@ import cloudinary.uploader
 from fastapi import UploadFile, File, Form
 from pydantic import BaseModel
 
-
 cloudinary.config(
     cloud_name='dbiifyr5m',
     api_key='931832746959244',
