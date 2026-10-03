@@ -53,17 +53,39 @@ friend_watchers: Dict[str,Set[str]]={}
 user_friend_lists: Dict[str,Set[str]]={}
 
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop]=None
-def _save_message_blocking(msg:dict):
-    messages_col.update_one({"_id":msg["_id"]},{"$set":msg},upsert=True)
-    return True
+def _save_message_blocking(msg: dict):
+    server_ts = now_utc().isoformat()
+    doc = {k: v for k, v in msg.items() if k not in ("_id", "received_at")}
+    # received_at is written only on first insert, so retries keep the original delivery time
+    messages_col.update_one(
+        {"_id": msg["_id"]},
+        {"$set": doc, "$setOnInsert": {"received_at": server_ts}},
+        upsert=True,
+    )
+    saved = messages_col.find_one({"_id": msg["_id"]}, {"received_at": 1}) or {}
+    return saved.get("received_at") or server_ts
 
-def _get_messages_page_blocking(user_a:str,user_b:str,before_sent_at,limit:int=10):
-    query= {"$or":[{"sent_by":user_a,"sent_to":user_b} ,{"sent_by":user_b,"sent_to":user_a},]}
+
+
+def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit: int = 10):
+    match = {"$or": [{"sent_by": user_a, "sent_to": user_b},
+                     {"sent_by": user_b, "sent_to": user_a}]}
+    pipeline = [
+        {"$match": match},
+        {"$addFields": {"_eff": {"$ifNull": ["$received_at", "$sent_at"]}}},
+    ]
     if before_sent_at:
-        query["sent_at"]={"$lt":before_sent_at}
-    docs=list(messages_col.find(query).sort("sent_at",-1).limit(limit))
+        pipeline.append({"$match": {"_eff": {"$lt": before_sent_at}}})
+    pipeline += [
+        {"$sort": {"_eff": -1}},
+        {"$limit": limit},
+        {"$project": {"_eff": 0}},
+    ]
+    docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
     docs.reverse()
     return docs
+
+
 
 def _mark_deleted_for_all_blocking(msg_id:str):
     messages_col.update_one({"_id":msg_id},{"$set":{"delete_from_all":True}})
@@ -458,33 +480,36 @@ async def push_scheduled_message(request:Request):
 from pydantic import Field
 
 class MessagePayload(BaseModel):
-    id: str=Field(...,alias= "_id")
+    id: str = Field(..., alias="_id")
     msg_type: str
     msg_content: str
-    is_edited: bool=False
+    is_edited: bool = False
     sent_by: str
     sent_to: str
     sent_at: str
-    delete_from_me: bool=False
-    delete_from_all: bool=False
-    thumbnail_url: Optional[str]=None
-    width: Optional[int]=None
-    height: Optional[int]=None
+    received_at: Optional[str] = None      # ignored on input, server sets it
+    delete_from_me: bool = False
+    delete_from_all: bool = False
+    thumbnail_url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
 
     class Config:
-        allow_population_by_field_name=True
-
+        allow_population_by_field_name = True
 
 
 
 @app.post("/send_message")
-async def send_message(payload:MessagePayload):
-    msg=payload.dict(by_alias=True)
-    await run_blocking(_save_message_blocking,msg)
-    peer_ws=connected_users.get(msg["sent_to"])
+async def send_message(payload: MessagePayload):
+    msg = payload.dict(by_alias=True)
+    received_at = await run_blocking(_save_message_blocking, msg)
+    msg["received_at"] = received_at
+    peer_ws = connected_users.get(msg["sent_to"])
     if peer_ws is not None:
-        await safe_send(peer_ws,{"type":"new_message","message":msg})
-    return {"ok":True}
+        await safe_send(peer_ws, {"type": "new_message", "message": msg})
+    return {"ok": True, "received_at": received_at}
+
+
 
 
 
@@ -664,16 +689,23 @@ async def delete_scheduled_image(req:DeleteImageRequest):
         return {"ok":True,"result":result.get("result")}
     except Exception as e:
         return {"ok":False,"error":str(e)}
+
+
+
 def _get_last_visible_message_blocking(user_a: str, user_b: str, viewer: str) -> Optional[dict]:
-    """Walks messages between user_a/user_b newest-first, skipping ones the viewer deleted for themselves."""
-    query = {"$or": [{"sent_by": user_a, "sent_to": user_b}, {"sent_by": user_b, "sent_to": user_a}]}
-    cursor = messages_col.find(query).sort("sent_at", -1)
-    for doc in cursor:
-        deleted_for = doc.get("deleted_for", []) or []
-        if viewer in deleted_for:
-            continue
-        return doc  # delete_from_all messages are fine to return, we just flag them below
-    return None
+    """Newest message (by received_at, falling back to sent_at) the viewer hasn't deleted for themselves."""
+    match = {
+        "$or": [{"sent_by": user_a, "sent_to": user_b}, {"sent_by": user_b, "sent_to": user_a}],
+        "deleted_for": {"$ne": viewer},
+    }
+    pipeline = [
+        {"$match": match},
+        {"$addFields": {"_eff": {"$ifNull": ["$received_at", "$sent_at"]}}},
+        {"$sort": {"_eff": -1}},
+        {"$limit": 1},
+    ]
+    docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
+    return docs[0] if docs else None
 
 
 def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional[dict]]:
@@ -693,6 +725,7 @@ def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional
             "sent_by": msg.get("sent_by"),
             "sent_to": msg.get("sent_to"),
             "sent_at": msg.get("sent_at"),
+            "received_at": msg.get("received_at"),   # may be None on old messages
             "delete_from_all": is_deleted_all,
         }
 
@@ -703,14 +736,14 @@ def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional
             msg_type = msg.get("msg_type")
             entry["msg_type"] = msg_type
             if msg_type == "text":
-                content = msg.get("msg_content") or ""
-                entry["msg_content"] = content[:300]
+                entry["msg_content"] = (msg.get("msg_content") or "")[:300]
             else:
-                entry["msg_content"] = None  # non-text: caller only needs msg_type
+                entry["msg_content"] = None
 
         result[friend_email] = entry
 
     return result
+
 
 
 @app.get("/last_messages_preview")
