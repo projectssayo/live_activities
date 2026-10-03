@@ -54,6 +54,9 @@ friend_watchers: Dict[str,Set[str]]={}
 
 
 user_friend_lists: Dict[str,Set[str]]={}
+last_clicked_mem: Dict[str, Dict[str, datetime]] = {}   # chat_id -> {sanitized_email: ts}
+dirty_clicks: Dict[str, Set[str]] = {}                  # email -> chat_ids needing a Mongo flush
+
 
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop]=None
 def _save_message_blocking(msg: dict):
@@ -138,7 +141,33 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-LEGACY_PRESENCE_FIELDS={"online":"","last_seen":""}
+def _remember_click(viewer: str, peer: str, ts: datetime):
+    chat_id = get_chat_id(viewer, peer)
+    last_clicked_mem.setdefault(chat_id, {})[sanitize_email(viewer)] = ts
+    dirty_clicks.setdefault(viewer, set()).add(chat_id)
+
+
+def _flush_clicks_blocking(email: str):
+    field = sanitize_email(email)
+    for chat_id in list(dirty_clicks.pop(email, ())):
+        ts = last_clicked_mem.get(chat_id, {}).get(field)
+        if ts:
+            # $max: an older value can never overwrite a newer one
+            last_clicked_col.update_one({"_id": chat_id}, {"$max": {field: ts}}, upsert=True)
+
+def _presence_fields(email: str, viewer: str) -> dict:
+    s = presence_state.get(email, {})
+    return {
+        "is_online": s.get("is_online", False),
+        "last_seen_at": s.get("last_seen_at"),
+        "on_chat_with_you": bool(s.get("is_online") and s.get("user_is_on") == viewer),
+    }
+
+
+
+
+LEGACY_PRESENCE_FIELDS = {"online": "", "last_seen": "", "user_is_on": ""}
+
 
 
 
@@ -150,12 +179,24 @@ def _create_friend_list_index_blocking():
     all_type_list_col.create_index("friend_list")
 
 
-def _persist_user_online_blocking(email:str,ts:datetime):
-    last_seen_col.update_one({"_id":email},{"$set":{"is_online":True,"last_seen_at":ts},"$unset":LEGACY_PRESENCE_FIELDS},upsert=True,)
+def _persist_user_online_blocking(email: str, ts: datetime):
+    last_seen_col.update_one(
+        {"_id": email},
+        {"$set": {"is_online": True, "last_seen_at": ts},
+         "$unset": LEGACY_PRESENCE_FIELDS},
+        upsert=True,
+    )
 
 
-def _persist_user_offline_blocking(email:str,ts:datetime):
-    last_seen_col.update_one({"_id":email},{"$set":{"is_online":False,"last_seen_at":ts,"user_is_on":None},"$unset":LEGACY_PRESENCE_FIELDS,},upsert=True,)
+
+def _persist_user_offline_blocking(email: str, ts: datetime):
+    last_seen_col.update_one(
+        {"_id": email},
+        {"$set": {"is_online": False, "last_seen_at": ts},
+         "$unset": LEGACY_PRESENCE_FIELDS},
+        upsert=True,
+    )
+
 
 
 def _persist_chat_target_blocking(email:str,target_email:Optional[str]):
@@ -170,33 +211,34 @@ def _persist_last_clicked_blocking(email:str,target_email:str,ts:datetime):
     last_clicked_col.update_one({"_id":chat_id,other_field:{"$exists":False}},{"$set":{other_field:None}},)
 
 
-def _push_last_clicked_batch_blocking(entries:List[dict]) -> List[str]:
-    ops=[]
-    chat_ids=[]
+def _push_last_clicked_batch_blocking(entries: List[dict]) -> List[str]:
+    ops = []
+    chat_ids = []
     for entry in entries:
         chat_id = entry.get("chat_id")
-        updates=entry.get("updates") or {}
+        updates = entry.get("updates") or {}
         if not chat_id or not updates:
             continue
 
-        parsed={}
-        for field,value in updates.items():
-            if value:
-                try:
-                    parsed[field]=datetime.fromisoformat(value.replace("Z","+00:00"))
-                except Exception:
-                    parsed[field]=None
-            else:
-                parsed[field]=None
+        parsed = {}
+        for field, value in updates.items():
+            if not value:
+                continue                      # never push None: $max would ignore it anyway
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                parsed[field] = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
 
-
-        ops.append(UpdateOne({"_id":chat_id},{"$set":parsed},upsert=True))
+        if parsed:
+            ops.append(UpdateOne({"_id": chat_id}, {"$max": parsed}, upsert=True))
         chat_ids.append(chat_id)
 
     if ops:
-        last_clicked_col.bulk_write(ops,ordered=False)
+        last_clicked_col.bulk_write(ops, ordered=False)
 
     return chat_ids
+
 
 
 def _record_login_blocking(email:str,mac_id:str,ts:datetime):
@@ -208,20 +250,30 @@ def _get_registered_mac_blocking(email:str) -> Optional[str]:
     return doc.get("mac_id") if doc else None
 
 
-def _load_all_presence_blocking() -> Dict[str,dict]:
-    result={}
+def _load_all_presence_blocking() -> Dict[str, dict]:
+    result = {}
     for doc in last_seen_col.find({}):
-        last_seen_at=doc.get("last_seen_at")
-        result[doc["_id"]]={"is_online":doc.get("is_online",False),"last_seen_at":last_seen_at.isoformat()if last_seen_at else None,"user_is_on":doc.get("user_is_on"),}
+        last_seen_at = doc.get("last_seen_at")
+        result[doc["_id"]] = {
+            "is_online": False,   # nobody is connected at server start
+            "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+            "user_is_on": None,
+        }
     return result
 
 
-def _load_missing_presence_blocking(emails:List[str]) -> Dict[str,dict]:
-    result={}
-    for doc in last_seen_col.find({"_id":{"$in":emails}}):
-        last_seen_at=doc.get("last_seen_at")
-        result[doc["_id"]]={"is_online":doc.get("is_online",False),"last_seen_at":last_seen_at.isoformat()if last_seen_at else None,"user_is_on":doc.get("user_is_on"),}
+def _load_missing_presence_blocking(emails: List[str]) -> Dict[str, dict]:
+    result = {}
+    for doc in last_seen_col.find({"_id": {"$in": emails}}):
+        last_seen_at = doc.get("last_seen_at")
+        result[doc["_id"]] = {
+            "is_online": doc.get("is_online", False),
+            "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+            "user_is_on": None,
+        }
     return result
+
+
 
 
 def _build_friend_watchers_and_lists_blocking():
@@ -257,58 +309,101 @@ async def safe_send(ws:Optional[WebSocket],payload:dict) -> None:
         pass
 
 
-async def broadcast_presence_to_friends(changed_email:str) -> None:
-    watchers=friend_watchers.get(changed_email)
+async def broadcast_presence_to_friends(changed_email: str) -> None:
+    watchers = friend_watchers.get(changed_email)
     if not watchers:
         return
-    payload={"type":"presence_update","email" : changed_email ,**presence_state.get(changed_email,{})}
-    await asyncio.gather(*(safe_send(connected_users.get(w),payload)for w in watchers if w in connected_users),return_exceptions=True,)
+    await asyncio.gather(
+        *(safe_send(connected_users.get(w),
+                    {"type": "presence_update", "email": changed_email,
+                     **_presence_fields(changed_email, w)})
+          for w in watchers if w in connected_users),
+        return_exceptions=True,
+    )
 
 
-async def notify_peer(peer_email:str,changed_email:str) -> None:
-    payload={"type":"presence_update","email":changed_email,**presence_state.get(changed_email,{})}
-    await safe_send(connected_users.get(peer_email),payload)
+
+async def notify_peer(peer_email: str, changed_email: str) -> None:
+    await safe_send(
+        connected_users.get(peer_email),
+        {"type": "presence_update", "email": changed_email,
+         **_presence_fields(changed_email, peer_email)},
+    )
 
 
-async def send_bulk_presence(requester_email:str,friend_emails:List[str]) -> None:
+
+async def send_seen_receipt(viewer: str, peer: str, ts: datetime) -> None:
+    await safe_send(
+        connected_users.get(peer),
+        {"type": "seen_receipt", "by": viewer, "seen_at": ts.isoformat()},
+    )
+
+
+async def leave_chat(email: str) -> None:
+    state = presence_state.get(email, {})
+    prev = state.get("user_is_on")
+    if not prev:
+        return
+    ts = now_utc()
+    state["user_is_on"] = None
+    _remember_click(email, prev, ts)
+    await send_seen_receipt(email, prev, ts)
+    await notify_peer(prev, email)
+
+
+async def enter_chat(email: str, target: str) -> None:
+    state = presence_state.setdefault(
+        email, {"is_online": True, "last_seen_at": None, "user_is_on": None})
+    if state.get("user_is_on") and state["user_is_on"] != target:
+        await leave_chat(email)
+    ts = now_utc()
+    state["user_is_on"] = target
+    _remember_click(email, target, ts)
+    await send_seen_receipt(email, target, ts)
+    await notify_peer(target, email)
+
+
+
+
+
+async def send_bulk_presence(requester_email: str, friend_emails: List[str]) -> None:
     ws = connected_users.get(requester_email)
     if ws is None or not friend_emails:
         return
 
-    updates=[]
-    missing=[]
-    for email in friend_emails:
-        state=presence_state.get(email)
-        if state is None:
-            missing.append(email)
-        else:
-            updates.append({"email":email,**state})
-
+    missing = [e for e in friend_emails if presence_state.get(e) is None]
     if missing:
-        fetched=await run_blocking(_load_missing_presence_blocking,missing)
-        for email,state in fetched.items():
-            presence_state[email]=state
-            updates.append({"email":email,**state})
+        fetched = await run_blocking(_load_missing_presence_blocking, missing)
+        for email, state in fetched.items():
+            presence_state[email] = state
+
+    updates = []
+    for email in friend_emails:
+        if presence_state.get(email) is None:
+            continue
+        updates.append({"email": email, **_presence_fields(email, requester_email)})
 
     print(f"[bulk_presence] -> {requester_email}: {len(updates)} entries ({len(missing)} fetched from mongo)")
-    await safe_send(ws,{"type" :"bulk_presence","updates":updates})
+    await safe_send(ws, {"type": "bulk_presence", "updates": updates})
 
 
 
-async def mark_user_online(email:str) -> None:
-    ts=now_utc()
-    prev=presence_state.get(email,{})
-    presence_state[email]={"is_online" : True,"last_seen_at":ts.isoformat(),"user_is_on":prev.get("user_is_on"),}
-    print(f"[presence] {email}: {prev} -> {presence_state[email]}")
-    asyncio.create_task(run_blocking(_persist_user_online_blocking,email,ts))
 
 
-async def mark_user_offline(email:str) -> None:
-    ts=now_utc()
-    prev= presence_state.get(email,{})
-    presence_state[email]={"is_online":False,"last_seen_at":ts.isoformat(),"user_is_on":None,}
-    print(f"[presence] {email}: {prev} -> {presence_state[email]}")
-    asyncio.create_task(run_blocking(_persist_user_offline_blocking ,email,ts))
+
+async def mark_user_online(email: str) -> None:
+    ts = now_utc()
+    presence_state[email] = {"is_online": True, "last_seen_at": ts.isoformat(), "user_is_on": None}
+    asyncio.create_task(run_blocking(_persist_user_online_blocking, email, ts))
+
+
+
+async def mark_user_offline(email: str) -> None:
+    ts = now_utc()
+    presence_state[email] = {"is_online": False, "last_seen_at": ts.isoformat(), "user_is_on": None}
+    asyncio.create_task(run_blocking(_persist_user_offline_blocking, email, ts))
+
+
 
 
 async def mark_chat_target(email:str,target_email:Optional[str]) -> None:
@@ -323,52 +418,44 @@ async def touch_last_clicked(email:str,target_email:str) -> None:
 
 
 
-async def handle_event(email:str ,data:dict) -> None:
-    event_type=data.get("type")
+async def handle_event(email: str, data: dict) -> None:
+    event_type = data.get("type")
 
-    if event_type=="opened_chat":
-        target_email=data.get("target_email")
-        if not target_email:
-            return
-        await mark_chat_target(email,target_email)
-        await touch_last_clicked(email,target_email)
-        await notify_peer(target_email,email)
+    if event_type == "opened_chat":
+        target = data.get("target_email")
+        if target:
+            await enter_chat(email, target)
 
-    elif event_type== "closed_chat":
-        target_email=presence_state.get(email,{}).get("user_is_on")
-        await mark_chat_target(email,None)
-        if target_email:
-            await touch_last_clicked(email,target_email)
-            await notify_peer(target_email,email)
+    elif event_type == "closed_chat":
+        await leave_chat(email)
 
-    elif event_type=="sync_request":
-        friend_emails=data.get("friend_list") or []
-        await send_bulk_presence(email,friend_emails)
+    elif event_type == "sync_request":
+        friend_emails = data.get("friend_list") or []
+        await send_bulk_presence(email, friend_emails)
 
-    elif event_type=="sync_last_clicked":
-
-        entries=data.get("entries") or []
+    elif event_type == "sync_last_clicked":
+        entries = data.get("entries") or []
         if not entries:
             return
-        synced_chat_ids=await run_blocking(_push_last_clicked_batch_blocking,entries)
-        await safe_send(connected_users.get(email),{"type":"sync_last_clicked_ack","chat_ids":synced_chat_ids,})
+        synced_chat_ids = await run_blocking(_push_last_clicked_batch_blocking, entries)
+        await safe_send(connected_users.get(email),
+                        {"type": "sync_last_clicked_ack", "chat_ids": synced_chat_ids})
 
 
-async def cleanup_user(email:str) -> None:
-    if connected_users.get(email) is None and socket_mac.get(email) is None:
+
+async def cleanup_user(email: str, ws: WebSocket) -> None:
+    if connected_users.get(email) is not ws:     # stale socket: user already reconnected
         return
 
-    connected_users.pop(email,None)
-    socket_mac.pop(email,None)
+    connected_users.pop(email, None)
+    socket_mac.pop(email, None)
 
-    target_email=presence_state.get(email ,{}).get("user_is_on")
+    await leave_chat(email)
     await mark_user_offline(email)
-
-    if target_email:
-        await touch_last_clicked(email,target_email)
-        await notify_peer(target_email,email)
-
+    await run_blocking(_flush_clicks_blocking, email)
     await broadcast_presence_to_friends(email)
+
+
 
 
 
@@ -385,8 +472,11 @@ def _watch_last_seen_changes():
                         continue
 
                     last_seen_at=full_doc.get("last_seen_at")
-                    new_state={"is_online":full_doc.get("is_online",False) ,"last_seen_at":last_seen_at.isoformat()if last_seen_at else None,"user_is_on":full_doc.get("user_is_on"),}
-                    old_state=presence_state.get(email)
+                    new_state = {
+    "is_online": full_doc.get("is_online", False),
+    "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+    "user_is_on": (old_state or {}).get("user_is_on"),
+}                    old_state=presence_state.get(email)
 
                     if old_state==new_state:
                         continue
@@ -613,7 +703,9 @@ async def websocket_endpoint(websocket:WebSocket,email:str,mac_id:str):
     except Exception:
         pass
     finally:
-        await cleanup_user(email)
+        await cleanup_user(email, websocket)
+
+
 @app.get("/friends_last_seen")
 async def friends_last_seen(emails:str):
     email_list =[e for e in emails.split(",")if e]
@@ -644,9 +736,25 @@ def root():
 
 
 @app.get("/status")
-async def get_status(me:str,friend:str):
-    return await run_blocking(_get_status_blocking,me,friend)
+async def get_status(me: str, friend: str):
+    out = await run_blocking(_get_status_blocking, me, friend)
 
+    mem = last_clicked_mem.get(get_chat_id(me, friend), {}).get(sanitize_email(friend))
+    if mem:
+        out["friend_last_clicked"] = mem.isoformat()
+
+    s = presence_state.get(friend, {})
+    out["is_online"] = s.get("is_online", out.get("is_online", False))
+    out["last_seen_at"] = s.get("last_seen_at", out.get("last_seen_at"))
+    out["is_on_same_chat_as_me"] = bool(s.get("is_online") and s.get("user_is_on") == me)
+    out.pop("user_is_on", None)
+
+    # Mongo datetimes are not JSON friendly
+    for k in ("last_seen_at", "my_last_clicked", "friend_last_clicked"):
+        v = out.get(k)
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+    return out
 
 @app.get("/check_mac/{email}")
 async def check_mac(email:str,mac_id:str):
