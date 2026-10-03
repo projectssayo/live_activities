@@ -466,29 +466,33 @@ def _watch_last_seen_changes():
             print("[last_seen watcher] change stream connected")
             with last_seen_col.watch(full_document="updateLookup") as stream:
                 for change in stream:
-                    email=change["documentKey"]["_id"]
-                    full_doc=change.get("fullDocument")
+                    email = change["documentKey"]["_id"]
+                    full_doc = change.get("fullDocument")
                     if not full_doc:
                         continue
 
-                    last_seen_at=full_doc.get("last_seen_at")
+                    old_state = presence_state.get(email)
+                    last_seen_at = full_doc.get("last_seen_at")
                     new_state = {
-    "is_online": full_doc.get("is_online", False),
-    "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
-    "user_is_on": (old_state or {}).get("user_is_on"),
-}                    old_state=presence_state.get(email)
+                        "is_online": full_doc.get("is_online", False),
+                        "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+                        "user_is_on": (old_state or {}).get("user_is_on"),
+                    }
 
-                    if old_state==new_state:
+                    if old_state == new_state:
                         continue
 
                     print(f"[last_seen CHANGED] {email}: {old_state} -> {new_state}")
-                    presence_state[email]=new_state
+                    presence_state[email] = new_state
 
                     if MAIN_LOOP is not None:
-                        asyncio.run_coroutine_threadsafe(broadcast_presence_to_friends(email),MAIN_LOOP)
+                        asyncio.run_coroutine_threadsafe(
+                            broadcast_presence_to_friends(email), MAIN_LOOP)
         except Exception as e:
             print(f"[last_seen watcher] stream error, retrying in 3s: {e}")
             time.sleep(3)
+
+
 
 
 def _watch_friend_list_changes():
