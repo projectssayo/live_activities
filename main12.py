@@ -29,6 +29,9 @@ last_clicked_col=db["last_clicked_on_table"]
 logged_in_col=db["logged_in_at"]
 messages_col=db["messages"]
 messages_col.create_index([("sent_by",1),("sent_to",1),("sent_at",-1)])
+from pymongo import MongoClient, UpdateOne, ReturnDocument
+messages_col.create_index([("sent_to", 1), ("received_at", 1)])
+
 user_db=client["user_db"]
 all_type_list_col=user_db["all_type_list_table"]
 
@@ -54,17 +57,20 @@ user_friend_lists: Dict[str,Set[str]]={}
 
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop]=None
 def _save_message_blocking(msg: dict):
-    server_ts = now_utc().isoformat()
-    doc = {k: v for k, v in msg.items() if k not in ("_id", "received_at")}
-    # received_at is written only on first insert, so retries keep the original delivery time
-    messages_col.update_one(
+    server_ts = now_utc().isoformat(timespec="microseconds")
+    insert_only_keys = ("is_edited", "delete_from_me", "delete_from_all")
+    insert_only = {k: msg[k] for k in insert_only_keys if k in msg}
+    doc = {k: v for k, v in msg.items()
+           if k not in ("_id", "received_at") and k not in insert_only_keys}
+    # received_at and delete/edit flags are written only on first insert, so retries can't change them
+    saved = messages_col.find_one_and_update(
         {"_id": msg["_id"]},
-        {"$set": doc, "$setOnInsert": {"received_at": server_ts}},
+        {"$set": doc, "$setOnInsert": {"received_at": server_ts, **insert_only}},
         upsert=True,
-    )
-    saved = messages_col.find_one({"_id": msg["_id"]}, {"received_at": 1}) or {}
+        return_document=ReturnDocument.AFTER,
+        projection={"received_at": 1},
+    ) or {}
     return saved.get("received_at") or server_ts
-
 
 
 def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit: int = 10):
@@ -754,3 +760,19 @@ async def last_messages_preview(user_email: str):
     except Exception as e:
         print(f"[last_messages_preview] error: {e}")
         return {"ok": False, "error": str(e), "friend_list_last_messages": {}}
+
+
+def _sync_incoming_blocking(user_email: str, since, limit: int = 200):
+    if not since:
+        return [], False
+    q = {"sent_to": user_email,
+         "received_at": {"$gt": since},
+         "deleted_for": {"$ne": user_email}}
+    docs = list(messages_col.find(q).sort("received_at", 1).limit(limit + 1))
+    return docs[:limit], len(docs) > limit
+
+
+@app.get("/sync_incoming")
+async def sync_incoming(user_email: str, since: Optional[str] = None, limit: int = 200):
+    docs, has_more = await run_blocking(_sync_incoming_blocking, user_email, since, limit)
+    return {"ok": True, "messages": docs, "has_more": has_more}
