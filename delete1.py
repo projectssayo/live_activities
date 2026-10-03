@@ -489,7 +489,10 @@ def get_chat_id(email1:str,email2:str) -> str:
 
 def get_local_chat_id(email_a:str,email_b:str) -> str:
     return f"chat_{min(email_a, email_b)}_{max(email_a, email_b)}"
-
+    
+def msg_time(m):
+    """Effective time of a message: received_at if present, else sent_at."""
+    return m.get('received_at') or m.get('sent_at')
 
 class FetchOlderMessagesThread(QThread):
     finished_ok=pyqtSignal(list)
@@ -531,11 +534,15 @@ class SendMessageThread(QThread):
             if resp.status_code >= 400:
                 self.error.emit(f"HTTP {resp.status_code}: {resp.text[:300]}")
                 return
-            self.finished_ok.emit(self.payload)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            self.finished_ok.emit(data if isinstance(data, dict) else {})
         except Exception as e:
             self.error.emit(str(e))
-            
-            
+
+
             
 
 
@@ -744,29 +751,13 @@ class ImageSaveThread(QThread):
 
 
 class MessagesLocalDB:
-    def __init__(self,db_path="messages.db"):
-        self.db_path=db_path
+    def __init__(self, db_path="messages.db"):
+        self.db_path = db_path
         self._lock = threading.Lock()
         self._init_db()
 
-    def mark_deleted_for_all(self,msg_id):
-        with self._lock:
-            conn=self._get_conn()
-            try:
-                cur=conn.execute("UPDATE messages SET delete_from_all=1, msg_type='delete_from_everyone' WHERE _id=?",(msg_id,))
-                conn.commit()
-                if cur.rowcount==0:
-                    return None
-                cols=[c[1]for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
-                row=conn.execute("SELECT * FROM messages WHERE _id=?",(msg_id,)).fetchone()
-            except sqlite3.OperationalError as e:
-                print(f"error in mark_deleted_for_all: {e}")
-                return None
-            finally:
-                conn.close()
-        return dict(zip(cols,row)) if row else None
     def _get_conn(self):
-        conn=sqlite3.connect(self.db_path,timeout=10,check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
         return conn
@@ -775,25 +766,37 @@ class MessagesLocalDB:
         conn = self._get_conn()
         try:
             conn.execute(
-                """CREATE TABLE IF NOT EXISTS messages ( _id TEXT PRIMARY KEY, msg_type TEXT, msg_content TEXT, thumbnail_url TEXT, local_thumbnail_path TEXT, local_image_path TEXT, is_edited INTEGER DEFAULT 0, sent_by TEXT, sent_to TEXT, sent_at TEXT, delete_from_me INTEGER DEFAULT 0, delete_from_all INTEGER DEFAULT 0, chat_id TEXT, width INTEGER, height INTEGER, synced INTEGER DEFAULT 1 )""")
-
-            try:
-                conn.execute("ALTER TABLE messages ADD COLUMN width INTEGER")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE messages ADD COLUMN height INTEGER")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                # existing rows become synced=1 (assumed already on the server)
-                conn.execute("ALTER TABLE messages ADD COLUMN synced INTEGER DEFAULT 1")
-            except sqlite3.OperationalError:
-                pass
+                """CREATE TABLE IF NOT EXISTS messages ( _id TEXT PRIMARY KEY, msg_type TEXT, msg_content TEXT, thumbnail_url TEXT, local_thumbnail_path TEXT, local_image_path TEXT, is_edited INTEGER DEFAULT 0, sent_by TEXT, sent_to TEXT, sent_at TEXT, delete_from_me INTEGER DEFAULT 0, delete_from_all INTEGER DEFAULT 0, chat_id TEXT, width INTEGER, height INTEGER, synced INTEGER DEFAULT 1, received_at TEXT )""")
+            for ddl in ("ALTER TABLE messages ADD COLUMN width INTEGER",
+                        "ALTER TABLE messages ADD COLUMN height INTEGER",
+                        "ALTER TABLE messages ADD COLUMN synced INTEGER DEFAULT 1",
+                        "ALTER TABLE messages ADD COLUMN received_at TEXT"):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sent_at ON messages(chat_id, sent_at)")
             conn.commit()
         finally:
             conn.close()
+
+    def mark_deleted_for_all(self, msg_id):
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cur = conn.execute(
+                    "UPDATE messages SET delete_from_all=1, msg_type='delete_from_everyone' WHERE _id=?", (msg_id,))
+                conn.commit()
+                if cur.rowcount == 0:
+                    return None
+                cols = [c[1] for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
+                row = conn.execute("SELECT * FROM messages WHERE _id=?", (msg_id,)).fetchone()
+            except sqlite3.OperationalError as e:
+                print(f"error in mark_deleted_for_all: {e}")
+                return None
+            finally:
+                conn.close()
+        return dict(zip(cols, row)) if row else None
 
     def _set_synced(self, msg_id, value):
         with self._lock:
@@ -812,6 +815,19 @@ class MessagesLocalDB:
     def mark_unsynced(self, msg_id):
         self._set_synced(msg_id, 0)
 
+    def set_received_at(self, msg_id, received_at):
+        if not received_at:
+            return
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute("UPDATE messages SET received_at=? WHERE _id=?", (received_at, msg_id))
+                conn.commit()
+            except sqlite3.OperationalError as e:
+                print(f"error in set_received_at: {e}")
+            finally:
+                conn.close()
+
     def get_unsynced(self, sender_email):
         with self._lock:
             conn = self._get_conn()
@@ -823,61 +839,69 @@ class MessagesLocalDB:
                 conn.close()
         return [dict(zip(cols, r)) for r in rows]
 
-
-
-    def upsert_message(self,msg:dict,chat_id:str):
+    def upsert_message(self, msg: dict, chat_id: str):
         with self._lock:
-            conn=self._get_conn()
+            conn = self._get_conn()
             try:
-                conn.execute("""INSERT INTO messages (_id, msg_type, msg_content, thumbnail_url, local_thumbnail_path, local_image_path, is_edited, sent_by, sent_to, sent_at, delete_from_me, delete_from_all, chat_id, width, height) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(_id) DO UPDATE SET msg_content=excluded.msg_content, thumbnail_url=excluded.thumbnail_url, local_thumbnail_path=COALESCE(excluded.local_thumbnail_path, local_thumbnail_path), local_image_path=COALESCE(excluded.local_image_path, local_image_path), is_edited=excluded.is_edited, delete_from_me=excluded.delete_from_me, delete_from_all=excluded.delete_from_all, width=COALESCE(excluded.width, width), height=COALESCE(excluded.height, height)""",(msg["_id"],msg["msg_type"],msg["msg_content"],msg.get("thumbnail_url"),msg.get("local_thumbnail_path"),msg.get("local_image_path"),int(msg.get("is_edited",False)),msg["sent_by"] , msg["sent_to"],msg["sent_at"],int(msg.get("delete_from_me",False)),int(msg.get("delete_from_all" ,False)),chat_id,msg.get("width"),msg.get("height")))
+                conn.execute(
+                    """INSERT INTO messages (_id, msg_type, msg_content, thumbnail_url, local_thumbnail_path, local_image_path, is_edited, sent_by, sent_to, sent_at, delete_from_me, delete_from_all, chat_id, width, height, received_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(_id) DO UPDATE SET msg_content=excluded.msg_content, thumbnail_url=excluded.thumbnail_url, local_thumbnail_path=COALESCE(excluded.local_thumbnail_path, local_thumbnail_path), local_image_path=COALESCE(excluded.local_image_path, local_image_path), is_edited=excluded.is_edited, delete_from_me=excluded.delete_from_me, delete_from_all=excluded.delete_from_all, width=COALESCE(excluded.width, width), height=COALESCE(excluded.height, height), received_at=COALESCE(excluded.received_at, received_at)""",
+                    (msg["_id"], msg["msg_type"], msg["msg_content"], msg.get("thumbnail_url"),
+                     msg.get("local_thumbnail_path"), msg.get("local_image_path"),
+                     int(msg.get("is_edited", False)), msg["sent_by"], msg["sent_to"], msg["sent_at"],
+                     int(msg.get("delete_from_me", False)), int(msg.get("delete_from_all", False)),
+                     chat_id, msg.get("width"), msg.get("height"), msg.get("received_at")))
                 conn.commit()
             except sqlite3.OperationalError as e:
                 print(f"error in upsert_message: {e}")
             finally:
                 conn.close()
 
-
-
-    def get_latest(self,chat_id,limit=CHAT_PAGE_SIZE):
-        with self._lock:
-            conn=self._get_conn()
-            try:
-                cols=[c[1]for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
-                rows=conn.execute("SELECT * FROM messages WHERE chat_id=? ORDER BY sent_at DESC LIMIT ?",(chat_id,limit)).fetchall()
-            finally:
-                conn.close()
-        return [dict(zip(cols,r))for r in rows][::-1]
-
-    def get_by_id(self,msg_id):
+    def get_latest(self, chat_id, limit=CHAT_PAGE_SIZE):
         with self._lock:
             conn = self._get_conn()
             try:
-                cols=[c[1]for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
-                row=conn.execute("SELECT * FROM messages WHERE _id=?",(msg_id,)).fetchone()
+                cols = [c[1] for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE chat_id=? ORDER BY COALESCE(received_at, sent_at) DESC LIMIT ?",
+                    (chat_id, limit)).fetchall()
+            finally:
+                conn.close()
+        return [dict(zip(cols, r)) for r in rows][::-1]
+
+    def get_by_id(self, msg_id):
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cols = [c[1] for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
+                row = conn.execute("SELECT * FROM messages WHERE _id=?", (msg_id,)).fetchone()
             finally:
                 conn.close()
         if row is None:
             return None
-        return dict(zip(cols,row))
+        return dict(zip(cols, row))
 
-    def get_before(self , chat_id,before_sent_at,limit=CHAT_PAGE_SIZE):
+    def get_before(self, chat_id, before_sent_at, limit=CHAT_PAGE_SIZE):
         with self._lock:
-            conn =self._get_conn()
+            conn = self._get_conn()
             try:
-                cols=[c[1]for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
-                rows=conn.execute("SELECT * FROM messages WHERE chat_id=? AND sent_at < ? ORDER BY sent_at DESC LIMIT ?",(chat_id,before_sent_at,limit)).fetchall()
+                cols = [c[1] for c in conn.execute("PRAGMA table_info(messages)").fetchall()]
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE chat_id=? AND COALESCE(received_at, sent_at) < ? "
+                    "ORDER BY COALESCE(received_at, sent_at) DESC LIMIT ?",
+                    (chat_id, before_sent_at, limit)).fetchall()
             finally:
                 conn.close()
-        return [dict(zip(cols,r))for r in rows][::-1]
+        return [dict(zip(cols, r)) for r in rows][::-1]
 
     def clear_all(self):
         with self._lock:
-            conn=self._get_conn()
+            conn = self._get_conn()
             try:
                 conn.execute("DELETE FROM messages")
                 conn.commit()
             finally:
                 conn.close()
+
 
 
 
@@ -1237,28 +1261,30 @@ class chating_main(QMainWindow):
         except Exception:
             print('error in on_last_messages_preview_fetched:\n'+traceback.format_exc())
 
+
+    
     def apply_last_message_preview(self, friend_email, entry):
         try:
             friend_entry = self.friend_list_left_label_dict.get(friend_email)
             if friend_entry is None or entry is None:
                 return
-
+    
+            t_eff = msg_time(entry) or ''
             existing_last = friend_entry.get('last_msg_sent_at')
-            if existing_last is not None and existing_last >= entry.get('sent_at', ''):
+            if existing_last is not None and existing_last >= t_eff:
                 return
-
+    
             msg_label = friend_entry['label'].m_label
             time_labl = friend_entry['label'].t_label
             is_curr = entry.get('sent_by') == self.current_user_email
-
+    
             self.set_text_to_stuff(time_labl,
-                                   datetime.fromisoformat(entry['sent_at']).astimezone().strftime('%H:%M %p'))
-
+                                   datetime.fromisoformat(t_eff).astimezone().strftime('%H:%M %p'))
+    
             msg_type = entry.get('msg_type')
             if msg_type == 'text':
                 for i in msg_label.findChildren(QWidget, options=Qt.FindDirectChildrenOnly):
                     i.deleteLater()
-
                 content = (entry.get('msg_content') or '').replace('\n', ' ')
                 self.set_text_to_stuff(msg_label, f'You : {content}' if is_curr else content)
             else:
@@ -1268,14 +1294,13 @@ class chating_main(QMainWindow):
                             'delete_from_everyone': ('svg_icons/delete.svg', 'Deleted Message'), }
                 icon_path, label_text = icon_map.get(msg_type, ('svg_icons/chat_report.svg', msg_type or ''))
                 self.render_friend_preview_media(msg_label, is_curr, icon_path, label_text)
-
-            friend_entry['last_msg_sent_at'] = entry.get('sent_at')
+    
+            friend_entry['last_msg_sent_at'] = t_eff
             friend_entry['last_msg_id'] = entry.get('_id')
         except Exception:
             print('error in apply_last_message_preview:\n' + traceback.format_exc())
 
-
-
+    
     def _init_chat_scroll(self):
         self._stick_bottom=True
         self._scroll_lock=False
@@ -1403,17 +1428,18 @@ class chating_main(QMainWindow):
         if msg_id in inflight:
             return
         inflight.add(msg_id)
-        # stays in the outbox until the server confirms
         self.local_messages_db.mark_unsynced(msg_id)
         t = SendMessageThread(payload)
-        t.finished_ok.connect(lambda p, mid=msg_id: self._on_message_sent(mid))
+        t.finished_ok.connect(lambda resp, mid=msg_id: self._on_message_sent(mid, resp))
         t.error.connect(lambda e, mid=msg_id: self._on_message_send_failed(mid, e))
         self._track_thread(t)
-
-    def _on_message_sent(self, msg_id):
+    
+    def _on_message_sent(self, msg_id, resp=None):
         self._inflight().discard(msg_id)
         self.local_messages_db.mark_synced(msg_id)
-
+        # server-stamped delivery time replaces the local placeholder (received_at == sent_at)
+        if resp and resp.get('received_at'):
+            self.local_messages_db.set_received_at(msg_id, resp['received_at'])
     def _on_message_send_failed(self, msg_id, err):
         print(f'send failed ({msg_id}): {err}')
         self._inflight().discard(msg_id)
@@ -1681,63 +1707,58 @@ class chating_main(QMainWindow):
             self._scroll_lock=False
 
 
-
-    def _populate_impl(self,messages):
+    
+    def _populate_impl(self, messages):
         try:
-            key='first' if self.current_central_chat_frame=='first' else 'second'
+            key = 'first' if self.current_central_chat_frame == 'first' else 'second'
             self.clear_chat_model(key)
-
-            seen =set()
-            deduped= []
+    
+            seen = set()
+            deduped = []
             for m in messages:
-                mid=m.get('_id')
+                mid = m.get('_id')
                 if mid in seen:
                     continue
                 seen.add(mid)
                 deduped.append(m)
-
-            deduped.sort(key=lambda x:x.get('sent_at')or '')
-
-            image_msgs=[]
-            self._suspend_day_rebuild=True
+    
+            deduped.sort(key=lambda x: msg_time(x) or '')
+    
+            image_msgs = []
+            self._suspend_day_rebuild = True
             try:
                 for m in deduped:
-                    is_mine=m.get('sent_by')==self.current_user_email
-
-                    if is_mine and int(m.get('delete_from_me')or 0):
+                    is_mine = m.get('sent_by') == self.current_user_email
+    
+                    if is_mine and int(m.get('delete_from_me') or 0):
                         continue
-
-
-
-                    if int(m.get('delete_from_all')or 0):
+    
+                    if int(m.get('delete_from_all') or 0):
                         self.push_a_single_delete_from_everyone_direct(m)
                         continue
-
-                    mtype=m.get('msg_type')
-                    if mtype== 'text':
+    
+                    mtype = m.get('msg_type')
+                    if mtype == 'text':
                         self.push_a_text_user_label(m)
-                    elif mtype=='sticker':
+                    elif mtype == 'sticker':
                         self.push_a_single_sticker(m)
-                    elif mtype=='gif':
+                    elif mtype == 'gif':
                         self.push_a_single_gif(m)
-                    elif mtype=='encrypt':
+                    elif mtype == 'encrypt':
                         self.push_a_single_locked_msg(m)
-                    elif mtype=='delete_from_everyone':
+                    elif mtype == 'delete_from_everyone':
                         self.push_a_single_delete_from_everyone_direct(m)
-                    elif mtype=='image':
+                    elif mtype == 'image':
                         image_msgs.append(m)
-
             finally:
-                self._suspend_day_rebuild=False
-
+                self._suspend_day_rebuild = False
+    
             self.rebuild_day_labels()
-
+    
             for m in image_msgs:
                 self.resolve_and_show_image(m)
-
         except Exception:
-            print('error in _populate_impl:\n'+traceback.format_exc())
-
+            print('error in _populate_impl:\n' + traceback.format_exc())
 
     def build_demo_messages(self,friend_email):
         now=datetime.now(timezone.utc)
@@ -1802,19 +1823,22 @@ class chating_main(QMainWindow):
         t.finished_error.connect(self.on_image_save_error)
         self._track_thread(t)
 
+
+    
     def on_image_saved(self, thumbnail_path, user_image_path, id1, width, height):
         try:
             self._stick_bottom = True
+            ts = datetime.now(timezone.utc).isoformat()
             payload = {'_id': id1, 'msg_type': 'image', 'msg_content': user_image_path,
                        'local_thumbnail_path': thumbnail_path, 'local_image_path': user_image_path,
                        'thumbnail_url': None, 'is_edited': False, 'sent_by': self.current_user_email,
-                       'sent_to': self.user_is_on_freind, 'sent_at': datetime.now(timezone.utc).isoformat(),
+                       'sent_to': self.user_is_on_freind, 'sent_at': ts, 'received_at': ts,
                        'delete_from_me': False, 'delete_from_all': False, 'width': width, 'height': height}
             self.push_a_single_image_user_label(payload, insert_sorted=False, ensure_today=True)
             chat_id = get_local_chat_id(self.current_user_email, payload['sent_to'])
             self.local_messages_db.upsert_message(payload, chat_id)
             self.local_messages_db.mark_unsynced(id1)
-
+    
             key = f'up_{id1}'
             self._inflight().add(key)
             up = ImageUploadThread(user_image_path, id1)
@@ -1830,7 +1854,6 @@ class chating_main(QMainWindow):
             self._track_thread(up)
         except Exception:
             print('error in on_image_saved:\n' + traceback.format_exc())
-
 
 
 
@@ -1997,23 +2020,28 @@ class chating_main(QMainWindow):
                     self.local_messages_db.upsert_message(data,chat_id)
                 break
 
-    def push_a_single_image_user_label(self ,data,insert_sorted=True,ensure_today= False):
+
+
+    def push_a_single_image_user_label(self, data, insert_sorted=True, ensure_today=False):
         try:
+            data = self._view(data)
             if self._widget_exists(data.get('_id')):
                 return
             if ensure_today:
                 self.ensure_day_label_for_today()
-            label=self.create_image_msg_label(data)
+            label = self.create_image_msg_label(data)
             if label is None:
                 return
             if insert_sorted:
-                self.insert_message_widget_sorted(label,data.get('sent_at'))
+                self.insert_message_widget_sorted(label, data.get('sent_at'))
             else:
                 self.push_image_label_in_chat(label)
-
         except Exception:
-            print('error in push_a_single_image_user_label:\n'+traceback.format_exc())
+            print('error in push_a_single_image_user_label:\n' + traceback.format_exc())
 
+
+
+    
     def push_image_label_in_chat(self,label):
         try:
             item=QStandardItem()
@@ -2460,23 +2488,27 @@ class chating_main(QMainWindow):
 
     def encrypt_text_save_button_clicked(self):
         try:
-            if self.encrypt_text_plainTextEdit.toPlainText().strip()=='':
+            if self.encrypt_text_plainTextEdit.toPlainText().strip() == '':
                 self.encrypt_text_plainTextEdit.setFocus()
                 return
-            if self.encrypted_password_lineEdit.text().strip()=='':
+            if self.encrypted_password_lineEdit.text().strip() == '':
                 self.encrypted_password_lineEdit.setFocus()
                 return
-            msg=self.encrypt_text_plainTextEdit.toPlainText().strip()
-            password=self.encrypted_password_lineEdit.text().strip()
+            msg = self.encrypt_text_plainTextEdit.toPlainText().strip()
+            password = self.encrypted_password_lineEdit.text().strip()
             self.hide_and_clear_all_encrypt_all_stuff()
-            self._stick_bottom=True
-            payload={'_id' : self.generate_random_id(),'msg_type':'encrypt','msg_content':self.encrypt_message_for_encipt_type(msg,password),'is_edited':False,'sent_by':self.current_user_email,'sent_at':datetime.now(timezone.utc).isoformat() , 'sent_to':self.user_is_on_freind,'delete_from_me':False,'delete_from_all':False}
+            self._stick_bottom = True
+            ts = datetime.now(timezone.utc).isoformat()
+            payload = {'_id': self.generate_random_id(), 'msg_type': 'encrypt',
+                       'msg_content': self.encrypt_message_for_encipt_type(msg, password), 'is_edited': False,
+                       'sent_by': self.current_user_email, 'sent_at': ts, 'received_at': ts,
+                       'sent_to': self.user_is_on_freind, 'delete_from_me': False, 'delete_from_all': False}
             self.push_a_single_locked_msg(payload)
-            chat_id=get_local_chat_id(self.current_user_email,self.user_is_on_freind)
-            self.local_messages_db.upsert_message(payload,chat_id)
+            chat_id = get_local_chat_id(self.current_user_email, self.user_is_on_freind)
+            self.local_messages_db.upsert_message(payload, chat_id)
             self._send_to_server(payload)
         except Exception:
-            print('error in encrypt_text_save_button_clicked:\n'+traceback.format_exc())
+            print('error in encrypt_text_save_button_clicked:\n' + traceback.format_exc())
 
     def encrypt_message_for_encipt_type(self ,msg,password):
         key=base64.urlsafe_b64encode(hashlib.sha256(password.encode("utf-8")).digest())
@@ -2508,7 +2540,13 @@ class chating_main(QMainWindow):
 
     def remove_orphaned_day_labels(self):
         self.rebuild_day_labels()
-
+    def _view(self, m):
+        """Copy of a message where 'sent_at' holds the effective time (received_at, else sent_at)."""
+        d = dict(m)
+        eff = msg_time(d)
+        d['received_at'] = eff
+        d['sent_at'] = eff
+        return d
     def ensure_day_label_for_today(self):
         today_str=datetime.now().strftime("%Y-%m-%d")
 
@@ -2572,11 +2610,11 @@ class chating_main(QMainWindow):
         self.view_encrypt_white_bg_label.setFixedSize(811,h)
         y=int((self.height()-h)//3.8)
         self.view_encrypt_content_frame.move(580,y)
-
-    def push_a_single_locked_msg(self,data):
+    
+    def push_a_single_locked_msg(self, data):
+        data = self._view(data)
         self.ensure_day_label_for_today()
-
-        label=self.create_locked_msg_label(data)
+        label = self.create_locked_msg_label(data)
         if label is None:
             return
         self.push_locked_label_in_chat(label)
@@ -3113,46 +3151,47 @@ class chating_main(QMainWindow):
             self._replace_widget_with_deleted_label(full)
         except Exception:
             print('error in on_message_deleted_all_pushed:\n' + traceback.format_exc())
-    def _replace_widget_with_deleted_label(self,data):
-        model=getattr(self ,'chat_free_model',None)
+    def _replace_widget_with_deleted_label(self, data):
+        model = getattr(self, 'chat_free_model', None)
         if model is None or self.current_central_chat_frame is None:
             return False
-        list_view= self.chat_list_view_1 if self.current_central_chat_frame=='first' else self.chat_list_view_2
-
-        target_index=None
+        list_view = self.chat_list_view_1 if self.current_central_chat_frame == 'first' else self.chat_list_view_2
+    
+        target_index = None
         for row in range(model.rowCount()):
-            item=model.item(row)
+            item = model.item(row)
             if item is None:
                 continue
-            index=model.indexFromItem(item)
-            widget=list_view.indexWidget(index)
-            if widget is not None and getattr(widget,'_id',None)==data['_id']:
-                target_index=index
+            index = model.indexFromItem(item)
+            widget = list_view.indexWidget(index)
+            if widget is not None and getattr(widget, '_id', None) == data['_id']:
+                target_index = index
                 break
-
-
+    
         if target_index is None:
             return False
-
-        data= dict(data)
-        data['msg_type']='delete_from_everyone'
-        data['delete_from_all']=True
-        data['is_temp']=False
-
-        new_label=self.create_delete_from_every_one_label(data)
+    
+        data = self._view(data)
+        data['msg_type'] = 'delete_from_everyone'
+        data['delete_from_all'] = True
+        data['is_temp'] = False
+    
+        new_label = self.create_delete_from_every_one_label(data)
         if new_label is None:
             return False
-
-        old_widget=list_view.indexWidget(target_index)
+    
+        old_widget = list_view.indexWidget(target_index)
         if old_widget is not None:
             old_widget.deleteLater()
-
-        size=new_label.sizeHint()
-        size.setHeight(size.height()+10)
+    
+        size = new_label.sizeHint()
+        size.setHeight(size.height() + 10)
         self.chat_free_model.itemFromIndex(target_index).setSizeHint(size)
-        list_view.setIndexWidget(target_index,new_label)
+        list_view.setIndexWidget(target_index, new_label)
         return True
 
+
+    
     def logout(self):
         try:
             self.ws_thread.close_chat()
@@ -3901,19 +3940,27 @@ class chating_main(QMainWindow):
 
         self.bottomStickerScrollAreaWidgetContents.setMinimumHeight(((len(image_list)+max_allowed-1)//max_allowed)*(height+gap_v))
 
-    def user_clicked_on_sticker_for_chat(self,name):
+
+    
+    
+    def user_clicked_on_sticker_for_chat(self, name):
         try:
             self.sticker_frame.hide()
-            self._stick_bottom=True
-            payload={'_id':self.generate_random_id(),'msg_type':'sticker','msg_content':name,'is_edited':False ,'sent_by':self.current_user_email,'sent_at':datetime.now(timezone.utc).isoformat(),'sent_to':self.user_is_on_freind , 'delete_from_me':False,'delete_from_all':False}
+            self._stick_bottom = True
+            ts = datetime.now(timezone.utc).isoformat()
+            payload = {'_id': self.generate_random_id(), 'msg_type': 'sticker', 'msg_content': name, 'is_edited': False,
+                       'sent_by': self.current_user_email, 'sent_at': ts, 'received_at': ts,
+                       'sent_to': self.user_is_on_freind, 'delete_from_me': False, 'delete_from_all': False}
             self.push_a_single_sticker(payload)
-            chat_id=get_local_chat_id(self.current_user_email,self.user_is_on_freind)
-            self.local_messages_db.upsert_message(payload,chat_id)
+            chat_id = get_local_chat_id(self.current_user_email, self.user_is_on_freind)
+            self.local_messages_db.upsert_message(payload, chat_id)
             self._send_to_server(payload)
         except Exception:
-            print('error in user_clicked_on_sticker_for_chat:\n'+traceback.format_exc())
+            print('error in user_clicked_on_sticker_for_chat:\n' + traceback.format_exc())
 
 
+
+    
     def get_sticker_cord(self,index,max_allowed=4,width=65,height=65,gap_v=3,gap_h=8):
         col=index % max_allowed
         row=index // max_allowed
@@ -4063,38 +4110,49 @@ class chating_main(QMainWindow):
 
         return super().eventFilter(obj,event)
 
-    def gif_label_clicked(self,gif):
+    
+    
+    def gif_label_clicked(self, gif):
         try:
-            self._stick_bottom=True
-            payload={'_id':self.generate_random_id(),'msg_type':'gif','msg_content' : gif.gif_path,'is_edited':False,'sent_by' : self.current_user_email,'sent_at':datetime.now(timezone.utc).isoformat(),'sent_to':self.user_is_on_freind,'delete_from_me':False,'delete_from_all':False}
+            self._stick_bottom = True
+            ts = datetime.now(timezone.utc).isoformat()
+            payload = {'_id': self.generate_random_id(), 'msg_type': 'gif', 'msg_content': gif.gif_path,
+                       'is_edited': False, 'sent_by': self.current_user_email, 'sent_at': ts, 'received_at': ts,
+                       'sent_to': self.user_is_on_freind, 'delete_from_me': False, 'delete_from_all': False}
             self.push_a_single_gif(payload)
-            chat_id=get_local_chat_id(self.current_user_email,self.user_is_on_freind)
-            self.local_messages_db.upsert_message(payload,chat_id)
+            chat_id = get_local_chat_id(self.current_user_email, self.user_is_on_freind)
+            self.local_messages_db.upsert_message(payload, chat_id)
             self._send_to_server(payload)
         except Exception:
-            print('error in gif_label_clicked:\n'+traceback.format_exc())
+            print('error in gif_label_clicked:\n' + traceback.format_exc())
 
+    
 
 
     def generate_random_id(self,length=12):
         characters=string.ascii_letters + string.digits
         return ''.join(secrets.choice(characters)for _ in range(length))
 
+    
+    
     def send_button_clicked(self):
         try:
-            msg=self.sendMeaasgePlainTextEdit.toPlainText().strip()
+            msg = self.sendMeaasgePlainTextEdit.toPlainText().strip()
             if not msg:
                 return
-            self._stick_bottom=True
-            payload={'_id':self.generate_random_id(),'msg_type':'text','msg_content':msg,'is_edited':False,'sent_by':self.current_user_email,'sent_at':datetime.now(timezone.utc).isoformat(),'sent_to': self.user_is_on_freind,'delete_from_me' :False,'delete_from_all':False}
+            self._stick_bottom = True
+            ts = datetime.now(timezone.utc).isoformat()
+            payload = {'_id': self.generate_random_id(), 'msg_type': 'text', 'msg_content': msg, 'is_edited': False,
+                       'sent_by': self.current_user_email, 'sent_at': ts, 'received_at': ts,
+                       'sent_to': self.user_is_on_freind, 'delete_from_me': False, 'delete_from_all': False}
             self.push_a_text_user_label(payload)
-            chat_id=get_local_chat_id(self.current_user_email,self.user_is_on_freind)
-            self.local_messages_db.upsert_message(payload,chat_id)
+            chat_id = get_local_chat_id(self.current_user_email, self.user_is_on_freind)
+            self.local_messages_db.upsert_message(payload, chat_id)
             self._send_to_server(payload)
             self.sendMeaasgePlainTextEdit.clear()
             self.changed()
         except Exception:
-            print('error in send_button_clicked:\n'+traceback.format_exc())
+            print('error in send_button_clicked:\n' + traceback.format_exc())
 
 
 
@@ -4670,15 +4728,17 @@ class chating_main(QMainWindow):
         self.delete_content_frame.move(540,y)
 
         self.user_msg_to_delete=data
-
-    def push_a_text_user_label(self,data):
+    
+    def push_a_text_user_label(self, data):
+        data = self._view(data)
         self.ensure_day_label_for_today()
-
-        label=self.create_text_msg_label(data)
+        label = self.create_text_msg_label(data)
         if label is None:
             return
         self.push_text_label_in_chat(label)
 
+
+    
     def push_text_label_in_chat(self,label):
         item=QStandardItem()
 
@@ -4969,12 +5029,13 @@ class chating_main(QMainWindow):
 
 
     def push_a_single_gif(self,data):
+        data = self._view(data)
         self.ensure_day_label_for_today()
-
-        label= self.create_gif_msg_label(data)
+        label = self.create_sticker_msg_label(data)
         if label is None:
             return
-        self.push_gif_label_in_chat(label)
+        self.push_sticker_label_in_chat(label)
+
 
     def push_gif_label_in_chat(self,label):
         try:
@@ -5244,31 +5305,34 @@ class chating_main(QMainWindow):
         transparent_long_bg_label.setFixedSize(max_main_bg_w+extra_height_for_time,gif_label.height())
         return transparent_long_bg_label
 
-    def push_a_single_delete_from_everyone_direct(self,data):
+
+    
+    def push_a_single_delete_from_everyone_direct(self, data):
         try:
             self.ensure_day_label_for_today()
-            data=dict(data)
-            data['msg_type']='delete_from_everyone'
-            data['delete_from_all']=True
-            data['is_temp'] =False
-            label=self.create_delete_from_every_one_label(data)
+            data = self._view(data)
+            data['msg_type'] = 'delete_from_everyone'
+            data['delete_from_all'] = True
+            data['is_temp'] = False
+            label = self.create_delete_from_every_one_label(data)
             if label is None:
                 return
-            item=QStandardItem()
-            size=label.sizeHint()
-            size.setHeight(size.height()+10)
+            item = QStandardItem()
+            size = label.sizeHint()
+            size.setHeight(size.height() + 10)
             item.setSizeHint(size)
             self.chat_free_model.appendRow(item)
-            index=self.chat_free_model.indexFromItem(item)
-            if self.current_central_chat_frame=='first':
-                self.chat_list_view_1.setIndexWidget(index,label)
+            index = self.chat_free_model.indexFromItem(item)
+            if self.current_central_chat_frame == 'first':
+                self.chat_list_view_1.setIndexWidget(index, label)
             else:
-                self.chat_list_view_2.setIndexWidget(index,label)
+                self.chat_list_view_2.setIndexWidget(index, label)
             self.rebuild_day_labels()
         except Exception:
-            print('error in push_a_single_delete_from_everyone_direct:\n'+traceback.format_exc())
+            print('error in push_a_single_delete_from_everyone_direct:\n' + traceback.format_exc())
 
 
+    
     def _day_key_from_iso(self,iso_ts):
         try:
             return datetime.fromisoformat(iso_ts).astimezone().strftime("%Y-%m-%d")
