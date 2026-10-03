@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime,timezone
 from typing import Dict,List,Optional,Set
+from pymongo import MongoClient, UpdateOne, ReturnDocument
 
 from fastapi import FastAPI,WebSocket,WebSocketDisconnect ,Request
 from pymongo import MongoClient,UpdateOne
@@ -29,7 +30,6 @@ last_clicked_col=db["last_clicked_on_table"]
 logged_in_col=db["logged_in_at"]
 messages_col=db["messages"]
 messages_col.create_index([("sent_by",1),("sent_to",1),("sent_at",-1)])
-from pymongo import MongoClient, UpdateOne, ReturnDocument
 messages_col.create_index([("sent_to", 1), ("received_at", 1)])
 
 user_db=client["user_db"]
@@ -72,13 +72,19 @@ def _save_message_blocking(msg: dict):
     ) or {}
     return saved.get("received_at") or server_ts
 
+def _eff_expr(viewer: str):
+    return {"$cond": [{"$eq": ["$sent_by", viewer]},
+                      "$sent_at",
+                      {"$ifNull": ["$received_at", "$sent_at"]}]}
+
+
 
 def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit: int = 10):
     match = {"$or": [{"sent_by": user_a, "sent_to": user_b},
                      {"sent_by": user_b, "sent_to": user_a}]}
     pipeline = [
         {"$match": match},
-        {"$addFields": {"_eff": {"$ifNull": ["$received_at", "$sent_at"]}}},
+        {"$addFields": {"_eff": _eff_expr(user_a)}},
     ]
     if before_sent_at:
         pipeline.append({"$match": {"_eff": {"$lt": before_sent_at}}})
@@ -90,7 +96,6 @@ def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit:
     docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
     docs.reverse()
     return docs
-
 
 
 def _mark_deleted_for_all_blocking(msg_id:str):
@@ -699,19 +704,19 @@ async def delete_scheduled_image(req:DeleteImageRequest):
 
 
 def _get_last_visible_message_blocking(user_a: str, user_b: str, viewer: str) -> Optional[dict]:
-    """Newest message (by received_at, falling back to sent_at) the viewer hasn't deleted for themselves."""
     match = {
         "$or": [{"sent_by": user_a, "sent_to": user_b}, {"sent_by": user_b, "sent_to": user_a}],
         "deleted_for": {"$ne": viewer},
     }
     pipeline = [
         {"$match": match},
-        {"$addFields": {"_eff": {"$ifNull": ["$received_at", "$sent_at"]}}},
+        {"$addFields": {"_eff": _eff_expr(viewer)}},
         {"$sort": {"_eff": -1}},
         {"$limit": 1},
     ]
     docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
     return docs[0] if docs else None
+
 
 
 def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional[dict]]:
