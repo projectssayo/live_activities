@@ -16,6 +16,7 @@ from fastapi import UploadFile,File,Form
 from pydantic import BaseModel
 
 
+
 cloudinary.config(cloud_name='dbiifyr5m',api_key='931832746959244',api_secret='W4-z0i5yUemucfL_uBPTFoDgH00',secure=True)
 MONGO_USERNAME="suyognegi_global"
 MONGO_PASSWORD="Oj5eGphIUUud9YvY"
