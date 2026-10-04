@@ -133,6 +133,35 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+
+recent_api_pushes: Dict[str, float] = {}
+API_PUSH_TTL = 15.0
+
+
+def _mark_api_push(kind: str, key: str):
+    now = time.monotonic()
+    recent_api_pushes[f"{kind}:{key}"] = now
+    if len(recent_api_pushes) > 2000:
+        for k, t in list(recent_api_pushes.items()):
+            if now - t > API_PUSH_TTL:
+                recent_api_pushes.pop(k, None)
+
+
+def _was_api_pushed(kind: str, key: str) -> bool:
+    t = recent_api_pushes.get(f"{kind}:{key}")
+    return t is not None and (time.monotonic() - t) < API_PUSH_TTL
+
+
+def _json_safe(o):
+    if isinstance(o, datetime):
+        return o.isoformat()
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    return o
+
+
 def _remember_click(viewer: str, peer: str, ts: datetime):
     chat_id = get_chat_id(viewer, peer)
     last_clicked_mem.setdefault(chat_id, {})[sanitize_email(viewer)] = ts
@@ -513,6 +542,80 @@ def _watch_friend_list_changes():
             time.sleep(3)
 
 
+async def _push_external_new(doc: dict):
+    note = {"type": "new_message", "message": _json_safe(doc)}
+    to, by = doc.get("sent_to"), doc.get("sent_by")
+    if to:
+        await send_to_user(to, note)
+    if by and by != to:
+        await send_to_user(by, note)
+
+
+async def _push_external_update(doc: dict, notes: List[dict], extra_users: Optional[List[str]] = None):
+    if extra_users is None:
+        users = {doc.get("sent_to"), doc.get("sent_by")}
+    else:
+        users = set(extra_users)
+    for u in [x for x in users if x]:
+        for n in notes:
+            await send_to_user(u, n)
+
+
+def _watch_messages_changes():
+    pipeline = [{"$match": {"operationType": {"$in": ["insert", "update"]}}}]
+    while True:
+        try:
+            print("[messages watcher] change stream connected")
+            with messages_col.watch(pipeline, full_document="updateLookup") as stream:
+                for change in stream:
+                    if MAIN_LOOP is None:
+                        continue
+                    op = change["operationType"]
+                    msg_id = change["documentKey"]["_id"]
+                    doc = change.get("fullDocument")
+                    if not doc:
+                        continue
+
+                    def run(coro):
+                        asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
+
+                    if op == "insert":
+                        if not doc.get("received_at"):
+                            # manual insert: stamp it so sync_incoming can find it later
+                            stamp = now_utc().isoformat(timespec="microseconds")
+                            messages_col.update_one(
+                                {"_id": msg_id, "received_at": {"$in": [None]}},
+                                {"$set": {"received_at": stamp}})
+                            doc["received_at"] = stamp
+                        if _was_api_pushed("new", msg_id):
+                            continue
+                        print(f"[messages watcher] external insert {msg_id}")
+                        run(_push_external_new(doc))
+                        continue
+
+                    updated = (change.get("updateDescription") or {}).get("updatedFields") or {}
+
+                    if updated.get("delete_from_all") is True:
+                        if not _was_api_pushed("del_all", msg_id):
+                            run(_push_external_update(doc, [{"type": "message_deleted_all", "_id": msg_id}]))
+                        continue
+
+                    if "msg_content" in updated or "is_edited" in updated:
+                        if not _was_api_pushed("edit", msg_id):
+                            run(_push_external_update(doc, [{"type": "message_edited", "_id": msg_id,
+                                                            "msg_content": doc.get("msg_content")}]))
+
+                    if any(k.startswith("deleted_for") for k in updated):
+                        whos = [w for w in (doc.get("deleted_for") or [])
+                                if not _was_api_pushed("del_me", f"{msg_id}:{w}")]
+                        if whos:
+                            run(_push_external_update(doc, [{"type": "message_deleted_me", "_id": msg_id}],
+                                                      extra_users=whos))
+        except Exception as e:
+            print(f"[messages watcher] stream error, retrying in 3s: {e}")
+            time.sleep(3)
+
+
 @app.on_event("startup")
 async def startup_event():
     global MAIN_LOOP, presence_state, friend_watchers, user_friend_lists
@@ -527,9 +630,12 @@ async def startup_event():
 
     threading.Thread(target=_watch_last_seen_changes, daemon=True, name="last_seen-watcher").start()
     threading.Thread(target=_watch_friend_list_changes, daemon=True, name="friend_list-watcher").start()
+    threading.Thread(target=_watch_messages_changes, daemon=True, name="messages-watcher").start()
 
     print(f"[startup] warmed presence_state({len(presence_state)}) "
           f"friend_watchers({len(friend_watchers)}) user_friend_lists({len(user_friend_lists)})")
+
+
 
 
 @app.post("/refresh_friend_graph")
@@ -587,22 +693,24 @@ class MessagePayload(BaseModel):
         allow_population_by_field_name = True
 
 
-# CHANGED: delivers to all receiver devices AND the sender's other devices
 @app.post("/send_message")
 async def send_message(payload: MessagePayload):
     msg = payload.dict(by_alias=True)
     origin_mac = msg.pop("origin_mac", None)
+
+    _mark_api_push("new", msg["_id"])          # NEW: tell the watcher we push this ourselves
+
     received_at = await run_blocking(_save_message_blocking, msg)
     msg["received_at"] = received_at
 
     note = {"type": "new_message", "message": msg}
-    # every device of the receiver
     await send_to_user(msg["sent_to"], note)
-    # every OTHER device of the sender (the sending device already has it)
     if msg["sent_by"] != msg["sent_to"]:
         await send_to_user(msg["sent_by"], note, exclude_mac=origin_mac)
 
     return {"ok": True, "received_at": received_at}
+
+
 
 
 @app.get("/get_messages_page")
@@ -611,27 +719,32 @@ async def get_messages_page(user_a: str, user_b: str, before_sent_at: Optional[s
     return {"ok": True, "messages": docs, "has_more": len(docs) == limit}
 
 
-# CHANGED: also notifies the sender's other devices
 @app.post("/mark_delete_for_all/{msg_id}")
 async def mark_delete_for_all(msg_id: str, request: Request):
     body = await request.json()
+
+    _mark_api_push("del_all", msg_id)          # NEW
+
     await run_blocking(_mark_deleted_for_all_blocking, msg_id)
     note = {"type": "message_deleted_all", "_id": msg_id}
 
     peer = body.get("notify_email")
     if peer:
-        await send_to_user(peer, note)                                       # all peer devices
+        await send_to_user(peer, note)
     who = body.get("who")
     if who:
-        await send_to_user(who, note, exclude_mac=body.get("origin_mac"))    # my other devices
+        await send_to_user(who, note, exclude_mac=body.get("origin_mac"))
     return {"ok": True}
 
 
-# CHANGED: tells my other devices (new event: message_deleted_me)
+
 @app.post("/mark_delete_for_me/{msg_id}")
 async def mark_delete_for_me(msg_id: str, request: Request):
     body = await request.json()
     who = body.get("who")
+
+    _mark_api_push("del_me", f"{msg_id}:{who}")   # NEW
+
     await run_blocking(_mark_deleted_for_me_blocking, msg_id, who)
     if who:
         await send_to_user(who, {"type": "message_deleted_me", "_id": msg_id},
@@ -639,10 +752,14 @@ async def mark_delete_for_me(msg_id: str, request: Request):
     return {"ok": True}
 
 
-# CHANGED: also notifies the sender's other devices
+
+
 @app.post("/edit_message/{msg_id}")
 async def edit_message(msg_id: str, request: Request):
     body = await request.json()
+
+    _mark_api_push("edit", msg_id)             # NEW
+
     await run_blocking(_edit_message_blocking, msg_id, body.get("msg_content"))
     note = {"type": "message_edited", "_id": msg_id, "msg_content": body.get("msg_content")}
 
@@ -653,6 +770,8 @@ async def edit_message(msg_id: str, request: Request):
     if who:
         await send_to_user(who, note, exclude_mac=body.get("origin_mac"))
     return {"ok": True}
+
+
 
 
 @app.post("/upload_chat_image")
