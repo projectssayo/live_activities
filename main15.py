@@ -302,6 +302,41 @@ def _build_friend_watchers_and_lists_blocking():
     return watchers, lists
 
 
+
+def _get_friend_list_blocking(user_email: str) -> List[str]:
+    doc = all_type_list_col.find_one({"_id": user_email}, {"friend_list": 1})
+    return (doc or {}).get("friend_list", [])
+
+
+def _build_unread_counts_blocking(user_email: str, friend_list: List[str]) -> Dict[str, int]:
+    me_field = sanitize_email(user_email)
+    chat_ids = {f: get_chat_id(user_email, f) for f in friend_list}
+
+    clicked = {}
+    if chat_ids:
+        for d in last_clicked_col.find({"_id": {"$in": list(chat_ids.values())}}, {me_field: 1}):
+            clicked[d["_id"]] = d.get(me_field)
+
+    out: Dict[str, int] = {}
+    for friend, cid in chat_ids.items():
+        q = {
+            "sent_by": friend,
+            "sent_to": user_email,
+            "delete_from_all": {"$ne": True},
+            "deleted_for": {"$ne": user_email},
+        }
+        ts = clicked.get(cid)
+        if ts:
+            if ts.tzinfo is None:                      # pymongo returns naive UTC datetimes
+                ts = ts.replace(tzinfo=timezone.utc)
+            q["received_at"] = {"$gt": ts.isoformat(timespec="microseconds")}
+        out[friend] = messages_col.count_documents(q, limit=100)   # capped, cheap
+    return out
+
+
+
+
+
 def _get_status_blocking(me: str, friend: str) -> dict:
     friend_doc = last_seen_col.find_one({"_id": friend}) or {}
     chat_id = get_chat_id(me, friend)
@@ -1003,10 +1038,15 @@ def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional
 async def last_messages_preview(user_email: str):
     try:
         data = await run_blocking(_build_last_messages_preview_blocking, user_email)
-        return {"ok": True, "friend_list_last_messages": data}
+        friends = await run_blocking(_get_friend_list_blocking, user_email)
+        unread = await run_blocking(_build_unread_counts_blocking, user_email, friends)
+        return {"ok": True, "friend_list_last_messages": data, "unread_counts": unread}
     except Exception as e:
         print(f"[last_messages_preview] error: {e}")
-        return {"ok": False, "error": str(e), "friend_list_last_messages": {}}
+        return {"ok": False, "error": str(e),
+                "friend_list_last_messages": {}, "unread_counts": {}}
+
+
 
 
 # CHANGED: catch-up now also returns messages I sent from another device
