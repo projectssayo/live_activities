@@ -112,8 +112,11 @@ def _eff_expr(viewer: str):
 
 
 def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit: int = 10):
-    match = {"$or": [{"sent_by": user_a, "sent_to": user_b},
-                     {"sent_by": user_b, "sent_to": user_a}]}
+    match = {
+        "$or": [{"sent_by": user_a, "sent_to": user_b},
+                {"sent_by": user_b, "sent_to": user_a}],
+        _dfm_path(user_a): {"$ne": True},   # NEW: skip messages user_a deleted "for me"
+    }
     pipeline = [
         {"$match": match},
         {"$addFields": {"_eff": _eff_expr(user_a)}},
@@ -128,6 +131,8 @@ def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit:
     docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
     docs.reverse()
     return docs
+
+    
 
 
 def _mark_deleted_for_all_blocking(msg_id: str):
