@@ -55,13 +55,23 @@ dirty_clicks: Dict[str, Set[str]] = {}                  # email -> chat_ids need
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
+
+def _dfm_path(email: str) -> str:
+    return f"delete_from_me.{sanitize_email(email)}"
+
+
+def _default_dfm(a: str, b: str) -> Dict[str, bool]:
+    return {sanitize_email(a): False, sanitize_email(b): False}
+
+
 def _save_message_blocking(msg: dict):
     server_ts = now_utc().isoformat(timespec="microseconds")
-    insert_only_keys = ("is_edited", "delete_from_me", "delete_from_all")
+    insert_only_keys = ("is_edited", "delete_from_all")
     insert_only = {k: msg[k] for k in insert_only_keys if k in msg}
+    # per-user delete flags are created only on first insert, so a retry can never un-delete
+    insert_only["delete_from_me"] = _default_dfm(msg["sent_by"], msg["sent_to"])
     doc = {k: v for k, v in msg.items()
-           if k not in ("_id", "received_at") and k not in insert_only_keys}
-    # received_at and delete/edit flags are written only on first insert, so retries can't change them
+           if k not in ("_id", "received_at", "delete_from_me") and k not in insert_only_keys}
     saved = messages_col.find_one_and_update(
         {"_id": msg["_id"]},
         {"$set": doc, "$setOnInsert": {"received_at": server_ts, **insert_only}},
@@ -70,6 +80,9 @@ def _save_message_blocking(msg: dict):
         projection={"received_at": 1},
     ) or {}
     return saved.get("received_at") or server_ts
+
+
+
 
 
 def _eff_expr(viewer: str):
@@ -101,8 +114,10 @@ def _mark_deleted_for_all_blocking(msg_id: str):
     messages_col.update_one({"_id": msg_id}, {"$set": {"delete_from_all": True}})
 
 
+
 def _mark_deleted_for_me_blocking(msg_id: str, who: str):
-    messages_col.update_one({"_id": msg_id}, {"$addToSet": {"deleted_for": who}})
+    messages_col.update_one({"_id": msg_id}, {"$set": {_dfm_path(who): True}})
+
 
 
 def _edit_message_blocking(msg_id: str, new_content: str):
@@ -323,15 +338,16 @@ def _build_unread_counts_blocking(user_email: str, friend_list: List[str]) -> Di
             "sent_by": friend,
             "sent_to": user_email,
             "delete_from_all": {"$ne": True},
-            "deleted_for": {"$ne": user_email},
+            _dfm_path(user_email): {"$ne": True},
         }
         ts = clicked.get(cid)
         if ts:
-            if ts.tzinfo is None:                      # pymongo returns naive UTC datetimes
+            if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             q["received_at"] = {"$gt": ts.isoformat(timespec="microseconds")}
-        out[friend] = messages_col.count_documents(q, limit=100)   # capped, cheap
+        out[friend] = messages_col.count_documents(q, limit=100)
     return out
+
 
 
 
@@ -616,7 +632,6 @@ def _watch_messages_changes():
 
                     if op == "insert":
                         if not doc.get("received_at"):
-                            # manual insert: stamp it so sync_incoming can find it later
                             stamp = now_utc().isoformat(timespec="microseconds")
                             messages_col.update_one(
                                 {"_id": msg_id, "received_at": {"$in": [None]}},
@@ -640,9 +655,18 @@ def _watch_messages_changes():
                             run(_push_external_update(doc, [{"type": "message_edited", "_id": msg_id,
                                                             "msg_content": doc.get("msg_content")}]))
 
-                    if any(k.startswith("deleted_for") for k in updated):
-                        whos = [w for w in (doc.get("deleted_for") or [])
-                                if not _was_api_pushed("del_me", f"{msg_id}:{w}")]
+                    if any(k.startswith("delete_from_me") for k in updated):
+                        flags = doc.get("delete_from_me") or {}
+                        whole = "delete_from_me" in updated          # whole dict replaced
+                        whos = []
+                        for w in {doc.get("sent_by"), doc.get("sent_to")}:
+                            if not w:
+                                continue
+                            if not (whole or _dfm_path(w) in updated):
+                                continue
+                            if flags.get(sanitize_email(w)) is True \
+                                    and not _was_api_pushed("del_me", f"{msg_id}:{w}"):
+                                whos.append(w)
                         if whos:
                             run(_push_external_update(doc, [{"type": "message_deleted_me", "_id": msg_id}],
                                                       extra_users=whos))
@@ -650,6 +674,28 @@ def _watch_messages_changes():
             print(f"[messages watcher] stream error, retrying in 3s: {e}")
             time.sleep(3)
 
+
+def _migrate_delete_from_me_blocking():
+    """One time: bool delete_from_me + deleted_for[] -> delete_from_me {sanitized_email: bool}."""
+    ops, total = [], 0
+    cursor = messages_col.find({"delete_from_me": {"$not": {"$type": "object"}}},
+                               {"sent_by": 1, "sent_to": 1, "deleted_for": 1})
+    for d in cursor:
+        if not d.get("sent_by") or not d.get("sent_to"):
+            continue
+        gone = set(d.get("deleted_for") or [])
+        dfm = {sanitize_email(d["sent_by"]): d["sent_by"] in gone,
+               sanitize_email(d["sent_to"]): d["sent_to"] in gone}
+        ops.append(UpdateOne({"_id": d["_id"]},
+                             {"$set": {"delete_from_me": dfm}, "$unset": {"deleted_for": ""}}))
+        if len(ops) >= 500:
+            messages_col.bulk_write(ops, ordered=False)
+            total += len(ops)
+            ops = []
+    if ops:
+        messages_col.bulk_write(ops, ordered=False)
+        total += len(ops)
+    print(f"[migrate] delete_from_me converted on {total} messages")
 
 @app.on_event("startup")
 async def startup_event():
@@ -659,6 +705,7 @@ async def startup_event():
 
     await run_blocking(_strip_legacy_presence_fields_blocking)
     await run_blocking(_create_friend_list_index_blocking)
+    await run_blocking(_migrate_delete_from_me_blocking)     # NEW: must run before the watchers start
 
     presence_state = await run_blocking(_load_all_presence_blocking)
     friend_watchers, user_friend_lists = await run_blocking(_build_friend_watchers_and_lists_blocking)
@@ -669,6 +716,7 @@ async def startup_event():
 
     print(f"[startup] warmed presence_state({len(presence_state)}) "
           f"friend_watchers({len(friend_watchers)}) user_friend_lists({len(user_friend_lists)})")
+
 
 
 
@@ -707,7 +755,10 @@ async def push_scheduled_message(request: Request):
         return {"ok": False, "error": str(e)}
 
 
-# CHANGED: added origin_mac
+
+
+
+
 class MessagePayload(BaseModel):
     id: str = Field(..., alias="_id")
     msg_type: str
@@ -717,15 +768,18 @@ class MessagePayload(BaseModel):
     sent_to: str
     sent_at: str
     received_at: Optional[str] = None      # ignored on input, server sets it
-    delete_from_me: bool = False
+    delete_from_me: Optional[Any] = None   # ignored on input, server builds the per-user dict
     delete_from_all: bool = False
     thumbnail_url: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
-    origin_mac: Optional[str] = None       # NEW: which device sent it (never stored)
+    origin_mac: Optional[str] = None       # which device sent it (never stored)
 
     class Config:
         allow_population_by_field_name = True
+
+
+
 
 
 @app.post("/send_message")
@@ -733,10 +787,11 @@ async def send_message(payload: MessagePayload):
     msg = payload.dict(by_alias=True)
     origin_mac = msg.pop("origin_mac", None)
 
-    _mark_api_push("new", msg["_id"])          # NEW: tell the watcher we push this ourselves
+    _mark_api_push("new", msg["_id"])
 
     received_at = await run_blocking(_save_message_blocking, msg)
     msg["received_at"] = received_at
+    msg["delete_from_me"] = _default_dfm(msg["sent_by"], msg["sent_to"])
 
     note = {"type": "new_message", "message": msg}
     await send_to_user(msg["sent_to"], note)
@@ -744,6 +799,7 @@ async def send_message(payload: MessagePayload):
         await send_to_user(msg["sent_by"], note, exclude_mac=origin_mac)
 
     return {"ok": True, "received_at": received_at}
+
 
 
 
@@ -982,10 +1038,11 @@ async def delete_scheduled_image(req: DeleteImageRequest):
         return {"ok": False, "error": str(e)}
 
 
+
 def _get_last_visible_message_blocking(user_a: str, user_b: str, viewer: str) -> Optional[dict]:
     match = {
         "$or": [{"sent_by": user_a, "sent_to": user_b}, {"sent_by": user_b, "sent_to": user_a}],
-        "deleted_for": {"$ne": viewer},
+        _dfm_path(viewer): {"$ne": True},
     }
     pipeline = [
         {"$match": match},
@@ -995,6 +1052,8 @@ def _get_last_visible_message_blocking(user_a: str, user_b: str, viewer: str) ->
     ]
     docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
     return docs[0] if docs else None
+
+
 
 
 def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional[dict]]:
@@ -1048,16 +1107,17 @@ async def last_messages_preview(user_email: str):
 
 
 
-
-# CHANGED: catch-up now also returns messages I sent from another device
 def _sync_incoming_blocking(user_email: str, since, limit: int = 200):
     if not since:
         return [], False
     q = {"$or": [{"sent_to": user_email}, {"sent_by": user_email}],
          "received_at": {"$gt": since},
-         "deleted_for": {"$ne": user_email}}
+         _dfm_path(user_email): {"$ne": True}}
     docs = list(messages_col.find(q).sort("received_at", 1).limit(limit + 1))
     return docs[:limit], len(docs) > limit
+
+
+
 
 
 @app.get("/sync_incoming")
