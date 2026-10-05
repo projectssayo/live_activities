@@ -28,7 +28,7 @@ logged_in_col = db["logged_in_at"]
 messages_col = db["messages"]
 messages_col.create_index([("sent_by", 1), ("sent_to", 1), ("sent_at", -1)])
 messages_col.create_index([("sent_to", 1), ("received_at", 1)])
-messages_col.create_index([("sent_by", 1), ("received_at", 1)])          # NEW: catch-up of my own msgs from other device
+messages_col.create_index([("sent_by", 1), ("received_at", 1)])        
 
 user_db = client["user_db"]
 all_type_list_col = user_db["all_type_list_table"]
