@@ -9,7 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi import UploadFile, File, Form
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, UpdateOne, ReturnDocument
-
+from typing import Any, Dict, List, Optional, Set
 import cloudinary
 import cloudinary.uploader
 
@@ -781,25 +781,24 @@ class MessagePayload(BaseModel):
 
 
 
-
 @app.post("/send_message")
 async def send_message(payload: MessagePayload):
-    msg = payload.dict(by_alias=True)
-    origin_mac = msg.pop("origin_mac", None)
-
-    _mark_api_push("new", msg["_id"])
-
-    received_at = await run_blocking(_save_message_blocking, msg)
-    msg["received_at"] = received_at
-    msg["delete_from_me"] = _default_dfm(msg["sent_by"], msg["sent_to"])
-
-    note = {"type": "new_message", "message": msg}
-    await send_to_user(msg["sent_to"], note)
-    if msg["sent_by"] != msg["sent_to"]:
-        await send_to_user(msg["sent_by"], note, exclude_mac=origin_mac)
-
-    return {"ok": True, "received_at": received_at}
-
+    try:
+        msg = payload.dict(by_alias=True)
+        origin_mac = msg.pop("origin_mac", None)
+        _mark_api_push("new", msg["_id"])
+        received_at = await run_blocking(_save_message_blocking, msg)
+        msg["received_at"] = received_at
+        msg["delete_from_me"] = _default_dfm(msg["sent_by"], msg["sent_to"])
+        note = {"type": "new_message", "message": msg}
+        await send_to_user(msg["sent_to"], note)
+        if msg["sent_by"] != msg["sent_to"]:
+            await send_to_user(msg["sent_by"], note, exclude_mac=origin_mac)
+        return {"ok": True, "received_at": received_at}
+    except Exception:
+        import traceback
+        print("[send_message] ERROR:\n" + traceback.format_exc())
+        raise
 
 
 
