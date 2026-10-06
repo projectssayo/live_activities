@@ -1036,10 +1036,14 @@ def health():
 
 
 @app.get("/get_scheduled_messages")
-async def get_scheduled_messages(from_user: str):
+async def get_scheduled_messages(from_user: str, after: Optional[str] = None):
     try:
+        # only messages that will be sent in the future
+        after_ = after or str(datetime.now())
+
         def do_read():
-            docs = list(messages_to_send_col.find({"from": from_user}))
+            docs = list(messages_to_send_col.find(
+                {"from": from_user, "scheduled_at": {"$gt": after_}}))
             for d in docs:
                 d["_id"] = str(d["_id"])
             return docs
@@ -1049,6 +1053,8 @@ async def get_scheduled_messages(from_user: str):
     except Exception as e:
         print(f"[get_scheduled_messages] error: {e}")
         return {"ok": False, "error": str(e), "messages": []}
+
+
 
 
 @app.post("/upload_scheduled_image")
