@@ -1227,7 +1227,7 @@ async def sync_incoming(user_email:str,since:Optional[str]=None,limit:int=200):
 
 
 
-@app.api_route("/process_scheduled_messages",methods=["GET","POST"])
+@app.api_route("/process_scheduled_messages",methods=["GET","POST","HEAD"])
 async def process_scheduled_messages(limit:int=200):
     try:
         result=await run_blocking(_process_scheduled_messages_blocking,limit)
