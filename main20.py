@@ -155,9 +155,15 @@ def _transform_scheduled_to_message(doc:dict,delivered_at:str) -> dict:
         if not content.startswith(("http://","https://")):
             raise ValueError("image not uploaded to cloud yet")
         thumbnail_url,width,height=_build_scheduled_image_fields(content,doc.get("cloud_public_id"))
+
+    hold_reason=_hold_reason_blocking(sender,receiver)
+    dfm=_default_dfm(sender,receiver)
+    if hold_reason:
+        dfm[sanitize_email(receiver)]=True
  
-    return {"_id":doc["_id"],"delete_from_all":False,"delete_from_me":_default_dfm(sender,receiver),"height":height,"is_edited" : False,"msg_content":content,"msg_type":mtype,"received_at":delivered_at,"sent_at":delivered_at ,"sent_by":sender,"sent_to":receiver,"thumbnail_url":thumbnail_url,"width":width,}
- 
+    return {"_id":doc["_id"],"delete_from_all":False,"delete_from_me":dfm,"height":height,"is_edited":False,"msg_content":content,"msg_type":mtype,"received_at":delivered_at,"sent_at":delivered_at,"sent_by":sender,"sent_to":receiver,"thumbnail_url":thumbnail_url,"width":width,"held_reason":hold_reason,}
+
+
  
 
 def _process_scheduled_messages_blocking(limit:int=200) -> dict:
@@ -201,6 +207,21 @@ def _dfm_path(email:str) -> str:
 def _default_dfm(a:str,b:str) -> Dict[str,bool]:
     return {sanitize_email(a):False,sanitize_email(b):False}
 
+def _hold_reason_blocking(sender:str,receiver:str) -> Optional[str]:
+    if not sender or not receiver or sender==receiver:
+        return None
+    doc=all_type_list_col.find_one({"_id":receiver},{"friend_list":1,"blocked_list":1})
+    if not doc:
+        return None
+    if sender in (doc.get("blocked_list") or []):
+        return "block"
+    if sender not in (doc.get("friend_list") or []):
+        return "unfriend"
+    return None
+    
+
+
+
 
 def _save_message_blocking(msg:dict):
     server_ts=now_utc().isoformat(timespec="microseconds")
@@ -213,19 +234,26 @@ def _save_message_blocking(msg:dict):
     else:
         sender_deleted=bool(raw_dfm)
 
+    hold_reason=_hold_reason_blocking(msg["sent_by"],msg["sent_to"])
+
     dfm=_default_dfm(msg["sent_by"],msg["sent_to"])
     if sender_deleted:
         dfm[sanitize_email(msg["sent_by"])]=True
+    if hold_reason:
+        dfm[sanitize_email(msg["sent_to"])]=True
     insert_only["delete_from_me"]=dfm
+    insert_only["held_reason"]=hold_reason
 
-    doc={k:v for k,v in msg.items()if k not in("_id","received_at" ,"delete_from_me")and k not in insert_only_keys}
+    doc={k:v for k,v in msg.items()if k not in("_id","received_at","delete_from_me","held_reason")and k not in insert_only_keys}
 
-    saved=messages_col.find_one_and_update({"_id":msg["_id"]},{"$set":doc,"$setOnInsert":{"received_at":server_ts,**insert_only}},upsert=True,return_document=ReturnDocument.AFTER,projection={"received_at":1},) or {}
+    saved=messages_col.find_one_and_update({"_id":msg["_id"]},{"$set":doc,"$setOnInsert":{"received_at":server_ts,**insert_only}},upsert=True,return_document=ReturnDocument.AFTER,projection={"received_at":1,"held_reason":1},) or {}
 
     if sender_deleted:
         messages_col.update_one({"_id":msg["_id"]},{"$set":{_dfm_path(msg["sent_by"]):True}})
 
-    return saved.get("received_at") or server_ts
+    return (saved.get("received_at") or server_ts),saved.get("held_reason")
+
+
 
 
 
@@ -261,6 +289,55 @@ def _mark_deleted_for_me_blocking(msg_id:str,who:str):
 
 def _edit_message_blocking(msg_id:str,new_content:str):
     messages_col.update_one({"_id":msg_id},{"$set":{"msg_content":new_content,"is_edited":True}})
+
+
+def _get_held_reason_blocking(msg_id:str) -> Optional[str]:
+    doc=messages_col.find_one({"_id":msg_id},{"held_reason":1})
+    return (doc or {}).get("held_reason")
+
+
+def _release_unfriend_held_blocking(a:str,b:str) -> List[dict]:
+    released=[]
+    for sender,receiver in ((a,b),(b,a)):
+        q={"sent_by":sender,"sent_to":receiver,"held_reason":"unfriend","delete_from_all":{"$ne":True}}
+        for d in list(messages_col.find(q,{"_id":1}).sort("sent_at",1)):
+            stamp=now_utc().isoformat(timespec="microseconds")
+            messages_col.update_one({"_id":d["_id"]},{"$set":{_dfm_path(receiver):False,"held_reason":None,"received_at":stamp}})
+            fresh=messages_col.find_one({"_id":d["_id"]})
+            if fresh:
+                released.append(fresh)
+    return released
+
+
+def _block_user_blocking(blocker:str,blocked:str,report:bool,reason:Optional[str]):
+    res=all_type_list_col.update_one({"_id":blocker},{"$addToSet":{"blocked_list":blocked},"$pull":{"friend_list":blocked}})
+    if res.matched_count==0:
+        raise ValueError("blocker not found")
+    if report:
+        evidence=[d["_id"] for d in messages_col.find({"sent_by":blocked,"sent_to":blocker},{"_id":1}).sort("sent_at",-1).limit(20)]
+        user_db["reports"].insert_one({"reporter":blocker,"reported":blocked,"reason":reason or "unspecified","chat_id":get_chat_id(blocker,blocked),"evidence_message_ids":evidence,"created_at":now_utc().isoformat(timespec="microseconds"),"status":"open",})
+
+
+def _unblock_user_blocking(blocker:str,blocked:str):
+    res=all_type_list_col.update_one({"_id":blocker},{"$pull":{"blocked_list":blocked}})
+    if res.matched_count==0:
+        raise ValueError("user not found")
+
+
+def _unfriend_user_blocking(user:str,friend:str):
+    res=all_type_list_col.update_one({"_id":user},{"$pull":{"friend_list":friend}})
+    if res.matched_count==0:
+        raise ValueError("user not found")
+
+
+def _clear_chat_blocking(user:str,friend:str) -> int:
+    q={"$or":[{"sent_by":user,"sent_to":friend},{"sent_by":friend,"sent_to":user}],_dfm_path(user):{"$ne":True}}
+    res=messages_col.update_many(q,{"$set":{_dfm_path(user):True}})
+    return res.modified_count
+
+
+
+
 
 
 EXECUTOR=ThreadPoolExecutor(max_workers=8)
@@ -648,6 +725,23 @@ def _watch_last_seen_changes():
             print(f"[last_seen watcher] stream error, retrying in 3s: {e}")
             time.sleep(3)
 
+async def _push_released_messages(docs:List[dict]):
+    for doc in docs:
+        if not doc:
+            continue
+        note={"type":"new_message","message":_json_safe(doc)}
+        await send_to_user(doc.get("sent_to"),note)
+        await send_to_user(doc.get("sent_by"),note)
+
+async def _push_released_messages(docs:List[dict]):
+    for doc in docs:
+        if not doc:
+            continue
+        note={"type":"new_message","message":_json_safe(doc)}
+        await send_to_user(doc.get("sent_to"),note)
+        await send_to_user(doc.get("sent_by"),note)
+
+
 
 def _watch_friend_list_changes():
     while True:
@@ -679,12 +773,23 @@ def _watch_friend_list_changes():
                         if watchers:
                             watchers.discard(user_email)
 
+                    for friend_email in added:
+                        if user_email in user_friend_lists.get(friend_email,set()):
+                            try:
+                                released=_release_unfriend_held_blocking(user_email,friend_email)
+                                if released and MAIN_LOOP is not None:
+                                    print(f"[friend_list watcher] released {len(released)} held message(s) between {user_email} and {friend_email}")
+                                    asyncio.run_coroutine_threadsafe(_push_released_messages(released),MAIN_LOOP)
+                            except Exception as e:
+                                print(f"[friend_list watcher] release failed: {e}")
 
                     if added and MAIN_LOOP is not None:
                         asyncio.run_coroutine_threadsafe(send_bulk_presence(user_email,list(added)),MAIN_LOOP)
         except Exception as e:
             print(f"[friend_list watcher] stream error, retrying in 3s: {e}")
             time.sleep(3)
+
+
 
 
 async def _push_external_new(doc:dict):
@@ -901,22 +1006,27 @@ async def send_message(payload:MessagePayload):
         if sender_deleted:
             _mark_api_push("del_me",f'{msg["_id"]}:{msg["sent_by"]}')
 
-        received_at=await run_blocking(_save_message_blocking,msg)
+        received_at,held_reason=await run_blocking(_save_message_blocking,msg)
         msg["received_at"]=received_at
+        msg["held_reason"]=held_reason
         dfm=_default_dfm(msg["sent_by"],msg["sent_to"])
         if sender_deleted:
             dfm[sanitize_email(msg["sent_by"])]=True
+        if held_reason:
+            dfm[sanitize_email(msg["sent_to"])]=True
         msg["delete_from_me"]=dfm
 
         note={"type":"new_message","message":msg}
-        await send_to_user(msg["sent_to"],note)
+        if not held_reason:
+            await send_to_user(msg["sent_to"],note)
         if msg["sent_by"]!=msg["sent_to"]:
             await send_to_user(msg["sent_by"],note,exclude_mac=origin_mac)
-        return {"ok" : True,"received_at":received_at}
+        return {"ok":True,"received_at":received_at,"held_reason":held_reason}
     except Exception:
         import traceback
         print("[send_message] ERROR:\n"+traceback.format_exc())
         raise
+
 
 
 
@@ -934,19 +1044,22 @@ async def mark_delete_for_all(msg_id:str,request:Request):
 
     _mark_api_push("del_all",msg_id)
 
+    held=await run_blocking(_get_held_reason_blocking,msg_id)
     await run_blocking(_mark_deleted_for_all_blocking,msg_id)
     note={"type":"message_deleted_all","_id":msg_id}
 
     peer=body.get("notify_email")
-    if peer:
+    if peer and not held:
         await send_to_user(peer,note)
     who=body.get("who")
     if who:
         await send_to_user(who,note,exclude_mac=body.get("origin_mac"))
     return {"ok" :True}
-
-
-
+    
+    
+    
+    
+    
 @app.post("/mark_delete_for_me/{msg_id}")
 async def mark_delete_for_me(msg_id:str,request:Request):
     body= await request.json()
@@ -961,23 +1074,86 @@ async def mark_delete_for_me(msg_id:str,request:Request):
 
 
 
-
 @app.post("/edit_message/{msg_id}")
 async def edit_message(msg_id:str,request:Request):
     body=await request.json()
 
     _mark_api_push("edit",msg_id)
 
+    held=await run_blocking(_get_held_reason_blocking,msg_id)
     await run_blocking(_edit_message_blocking,msg_id,body.get("msg_content"))
     note= {"type":"message_edited","_id":msg_id,"msg_content":body.get("msg_content")}
 
     peer =body.get("notify_email")
-    if peer:
+    if peer and not held:
         await send_to_user(peer,note)
     who=body.get("who")
     if who:
         await send_to_user(who,note,exclude_mac=body.get("origin_mac"))
     return {"ok":True}
+
+
+
+@app.post("/block_user")
+async def block_user(request:Request):
+    try:
+        body=await request.json()
+        blocker=body.get("blocker")
+        blocked=body.get("blocked")
+        if not blocker or not blocked or blocker==blocked:
+            return {"ok":False,"error":"invalid users"}
+        await run_blocking(_block_user_blocking,blocker,blocked,bool(body.get("report")),body.get("reason"))
+        return {"ok":True}
+    except Exception as e:
+        print(f"[block_user] error: {e}")
+        return {"ok":False,"error":str(e)}
+
+
+@app.post("/unblock_user")
+async def unblock_user(request:Request):
+    try:
+        body=await request.json()
+        blocker=body.get("blocker")
+        blocked=body.get("blocked")
+        if not blocker or not blocked:
+            return {"ok":False,"error":"invalid users"}
+        await run_blocking(_unblock_user_blocking,blocker,blocked)
+        return {"ok":True}
+    except Exception as e:
+        print(f"[unblock_user] error: {e}")
+        return {"ok":False,"error":str(e)}
+
+
+@app.post("/unfriend_user")
+async def unfriend_user(request:Request):
+    try:
+        body=await request.json()
+        user=body.get("user")
+        friend=body.get("friend")
+        if not user or not friend or user==friend:
+            return {"ok":False,"error":"invalid users"}
+        await run_blocking(_unfriend_user_blocking,user,friend)
+        return {"ok":True}
+    except Exception as e:
+        print(f"[unfriend_user] error: {e}")
+        return {"ok":False,"error":str(e)}
+
+
+@app.post("/clear_chat")
+async def clear_chat(request:Request):
+    try:
+        body=await request.json()
+        user=body.get("user")
+        friend=body.get("friend")
+        if not user or not friend:
+            return {"ok":False,"error":"invalid users"}
+        n=await run_blocking(_clear_chat_blocking,user,friend)
+        return {"ok":True,"cleared":n}
+    except Exception as e:
+        print(f"[clear_chat] error: {e}")
+        return {"ok":False,"error":str(e)}
+
+
 
 
 
