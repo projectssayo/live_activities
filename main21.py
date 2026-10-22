@@ -311,13 +311,17 @@ def _release_unfriend_held_blocking(a:str,b:str) -> List[dict]:
 
 
 def _block_user_blocking(blocker:str,blocked:str,report:bool,reason:Optional[str]):
-    res=all_type_list_col.update_one({"_id":blocker},{"$addToSet":{"blocked_list":blocked},"$pull":{"friend_list":blocked}})
+    res=all_type_list_col.update_one({"_id":blocker},{"$addToSet":{"blocked_list":blocked},"$pull":{"friend_list":blocked,"incoming_list":blocked,"outgoing_list":blocked}})
     if res.matched_count==0:
         raise ValueError("blocker not found")
+    all_type_list_col.update_one({"_id":blocked},{"$pull":{"incoming_list":blocker,"outgoing_list":blocker}})
     if report:
         evidence=[d["_id"] for d in messages_col.find({"sent_by":blocked,"sent_to":blocker},{"_id":1}).sort("sent_at",-1).limit(20)]
-        user_db["reports"].insert_one({"reporter":blocker,"reported":blocked,"reason":reason or "unspecified","chat_id":get_chat_id(blocker,blocked),"evidence_message_ids":evidence,"created_at":now_utc().isoformat(timespec="microseconds"),"status":"open",})
-
+        user_db["reports"].update_one(
+            {"reporter":blocker,"reported":blocked,"status":"open"},
+            {"$set":{"reason":reason or "unspecified","chat_id":get_chat_id(blocker,blocked),"evidence_message_ids":evidence},
+             "$setOnInsert":{"created_at":now_utc().isoformat(timespec="microseconds")}},
+            upsert=True)
 
 def _unblock_user_blocking(blocker:str,blocked:str):
     res=all_type_list_col.update_one({"_id":blocker},{"$pull":{"blocked_list":blocked}})
@@ -330,12 +334,13 @@ def _unfriend_user_blocking(user:str,friend:str):
     if res.matched_count==0:
         raise ValueError("user not found")
 
-
-def _clear_chat_blocking(user:str,friend:str) -> int:
+def _clear_chat_blocking(user:str,friend:str,before:Optional[str]=None) -> int:
     q={"$or":[{"sent_by":user,"sent_to":friend},{"sent_by":friend,"sent_to":user}],_dfm_path(user):{"$ne":True}}
+    cutoff=_norm_iso_utc(before) if before else None
+    if cutoff:
+        q={"$and":[q,{"$or":[{"sent_by":user,"sent_at":{"$lte":cutoff}},{"sent_by":friend,"received_at":{"$lte":cutoff}}]}]}
     res=messages_col.update_many(q,{"$set":{_dfm_path(user):True}})
     return res.modified_count
-
 
 
 
@@ -1140,6 +1145,8 @@ async def unfriend_user(request:Request):
         return {"ok":False,"error":str(e)}
 
 
+
+
 @app.post("/clear_chat")
 async def clear_chat(request:Request):
     try:
@@ -1148,12 +1155,11 @@ async def clear_chat(request:Request):
         friend=body.get("friend")
         if not user or not friend:
             return {"ok":False,"error":"invalid users"}
-        n=await run_blocking(_clear_chat_blocking,user,friend)
+        n=await run_blocking(_clear_chat_blocking,user,friend,body.get("before"))
         return {"ok":True,"cleared":n}
     except Exception as e:
         print(f"[clear_chat] error: {e}")
         return {"ok":False,"error":str(e)}
-
 
 
 
