@@ -1,6 +1,9 @@
 fastapi
 uvicorn[standard]
-motor
 websockets
+pymongo[srv]
 cloudinary
+httpx
+argon2-cffi
+pydantic
 python-multipart
