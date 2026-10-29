@@ -910,19 +910,19 @@ def _block_user_blocking(blocker: str, blocked: str, report: bool, reason: Optio
         raise ValueError("User relationship data not found.")
 
     if blocked in blocker_lists.get("blocked_list", []):
-        raise ValueError("This user is already blocked.")
-
-    all_type_list_col.update_one(
-        {"_id": blocker},
-        {
-            "$addToSet": {"blocked_list": blocked},
-            "$pull": {
-                "friend_list": blocked,
-                "incoming_list": blocked,
-                "outgoing_list": blocked,
+        # idempotent: already blocked, still make sure the report is stored when asked
+        if not report:
+            return
+    else:
+        all_type_list_col.update_one(
+            {"_id": blocker},
+            {
+                "$addToSet": {"blocked_list": blocked},
+                "$pull": {"friend_list": blocked, "incoming_list": blocked, "outgoing_list": blocked},
             },
-        },
-    )
+        )
+
+    # the blocked side loses every relationship with the blocker, in every list
     all_type_list_col.update_one(
         {"_id": blocked},
         {"$pull": {
@@ -953,6 +953,8 @@ def _block_user_blocking(blocker: str, blocked: str, report: bool, reason: Optio
         )
 
 
+
+
 def _unblock_user_blocking(blocker: str, blocked: str):
     if not user_table.find_one({"_id": blocker}):
         raise ValueError(f"User {blocker} does not exist")
@@ -976,7 +978,6 @@ async def block_user(request: Request):
         data = await _read_request_params(request)
         blocker = data.get("blocker") or data.get("from_user")
         blocked = data.get("blocked") or data.get("to_") or data.get("to_user")
-
         if not blocker or not blocked:
             return _block_unblock_response(False, "invalid users")
         if blocker == blocked:
@@ -989,12 +990,19 @@ async def block_user(request: Request):
             _as_bool(data.get("report", False)),
             data.get("reason"),
         )
-        return _block_unblock_response(True, "User blocked successfully.")
+
+        my_snap = await run_blocking(_relationship_snapshot, blocker)
+        other_snap = await run_blocking(_relationship_snapshot, blocked)
+        await _push_relationship_to_user(blocker, my_snap, "block", blocked)
+        await _push_relationship_to_user(blocked, other_snap, "blocked_by", blocker)
+        return _block_unblock_response(True, "User blocked successfully.", data={"lists": my_snap})
     except ValueError as e:
         return _block_unblock_response(False, str(e))
     except Exception as e:
         print(f"[block_user] error: {e}")
         return {"ok": False, "success": False, "server": False, "msg": f"error {e}", "error": str(e)}
+
+
 
 
 @app.post("/unblock_user")
@@ -1003,21 +1011,24 @@ async def unblock_user(request: Request):
         data = await _read_request_params(request)
         blocker = data.get("blocker") or data.get("from_user")
         blocked = data.get("blocked") or data.get("to_") or data.get("to_user")
-
         if not blocker or not blocked:
             return _block_unblock_response(False, "invalid users")
 
         await run_blocking(_unblock_user_blocking, blocker, blocked)
+        my_snap = await run_blocking(_relationship_snapshot, blocker)
+        await _push_relationship_to_user(blocker, my_snap, "unblock", blocked)
         return _block_unblock_response(
             True,
             f"User {blocked} unblocked successfully by {blocker}",
-            data={"from_user": blocker, "to_user": blocked},
+            data={"from_user": blocker, "to_user": blocked, "lists": my_snap},
         )
     except ValueError as e:
         return _block_unblock_response(False, str(e))
     except Exception as e:
         print(f"[unblock_user] error: {e}")
         return {"ok": False, "success": False, "server": True, "msg": str(e), "error": str(e), "data": {}}
+
+
 
 
 @app.get("/watch_any_request")
@@ -1504,10 +1515,16 @@ def _release_unfriend_held_blocking(a: str, b: str) -> List[dict]:
     return released
 
 
-def _unfriend_user_blocking(user: str, friend: str):
-    res = all_type_list_col.update_one({"_id": user}, {"$pull": {"friend_list": friend}})
-    if res.matched_count == 0:
+def _unfriend_user_blocking(user: str, friend: str) -> dict:
+    if user == friend:
+        raise ValueError("invalid users")
+    if all_type_list_col.find_one({"_id": user}) is None:
         raise ValueError("user not found")
+
+    # remove from both sides so neither list keeps a stale friend entry
+    all_type_list_col.update_one({"_id": user}, {"$pull": {"friend_list": friend}})
+    all_type_list_col.update_one({"_id": friend}, {"$pull": {"friend_list": user}})
+    return {"unfriended": True}
 
 
 def _clear_chat_blocking(user: str, friend: str, before: Optional[str] = None) -> int:
@@ -1855,17 +1872,21 @@ async def handle_event(email: str, data: dict) -> None:
     elif event_type == "sync_request":
         friend_emails = data.get("friend_list") or []
         await send_bulk_presence(email, friend_emails)
+        snap = await run_blocking(_relationship_snapshot, email)
+        await send_to_user(email, {"type": "relationship_changed", "reason": "sync", "other": None, "lists": snap})
         pending = await run_blocking(_pop_pending_notifications_blocking, email)
         for note in pending:
             await send_to_user(email, note)
 
-    
     elif event_type == "sync_last_clicked":
         entries = data.get("entries") or []
         if not entries:
             return
         synced_chat_ids = await run_blocking(_push_last_clicked_batch_blocking, entries)
         await send_to_user(email, {"type": "sync_last_clicked_ack", "chat_ids": synced_chat_ids})
+
+
+
 
 
 async def cleanup_user(email: str, mac_id: str, ws: WebSocket) -> None:
@@ -1951,7 +1972,6 @@ def _watch_friend_list_changes():
                     print(f"[friend_list CHANGED] {user_email}: +{added} -{removed}")
 
                     user_friend_lists[user_email] = new_friends
-
                     for friend_email in added:
                         friend_watchers.setdefault(friend_email, set()).add(user_email)
                     for friend_email in removed:
@@ -1960,6 +1980,14 @@ def _watch_friend_list_changes():
                             watchers.discard(user_email)
 
                     if MAIN_LOOP is not None:
+                        snap = {
+                            "friend_list": list(new_friends),
+                            "incoming_list": list(full_doc.get("incoming_list", [])),
+                            "outgoing_list": list(full_doc.get("outgoing_list", [])),
+                            "blocked_list": list(full_doc.get("blocked_list", [])),
+                        }
+                        asyncio.run_coroutine_threadsafe(
+                            _push_relationship_to_user(user_email, snap, "watcher"), MAIN_LOOP)
                         for friend_email in added:
                             asyncio.run_coroutine_threadsafe(
                                 send_to_user(user_email, {"type": "friend_added", "email": friend_email}),
@@ -1980,6 +2008,8 @@ def _watch_friend_list_changes():
         except Exception as e:
             print(f"[friend_list watcher] stream error, retrying in 3s: {e}")
             time.sleep(3)
+
+
 
 
 
@@ -2314,13 +2344,22 @@ async def unfriend_user(request: Request):
         body = await request.json()
         user = body.get("user")
         friend = body.get("friend")
-        if not user or not friend or user == friend:
+        if not user or not friend:
             return {"ok": False, "error": "invalid users"}
+
         await run_blocking(_unfriend_user_blocking, user, friend)
-        return {"ok": True}
+
+        my_snap = await run_blocking(_relationship_snapshot, user)
+        friend_snap = await run_blocking(_relationship_snapshot, friend)
+        await _push_relationship_to_user(user, my_snap, "unfriend", friend)
+        await _push_relationship_to_user(friend, friend_snap, "unfriended_by", user)
+        return {"ok": True, "lists": my_snap}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
     except Exception as e:
         print(f"[unfriend_user] error: {e}")
         return {"ok": False, "error": str(e)}
+
 
 
 @app.post("/clear_chat")
@@ -2608,6 +2647,26 @@ async def process_scheduled_messages(limit: int = 200):
 
 
 
+def _relationship_snapshot(email: str) -> dict:
+    doc = all_type_list_col.find_one({"_id": email}) or {}
+    return {
+        "friend_list": list(doc.get("friend_list", [])),
+        "incoming_list": list(doc.get("incoming_list", [])),
+        "outgoing_list": list(doc.get("outgoing_list", [])),
+        "blocked_list": list(doc.get("blocked_list", [])),
+    }
+
+
+async def _push_relationship_to_user(email: str, snapshot: dict, reason: str, other: str = None) -> None:
+    await send_to_user(email, {
+        "type": "relationship_changed",
+        "reason": reason,
+        "other": other,
+        "lists": snapshot,
+    })
+
+
+
 def _accept_friend_request_blocking(me: str, sender: str) -> dict:
     if me == sender:
         raise ValueError("You cannot accept your own request.")
@@ -2620,11 +2679,12 @@ def _accept_friend_request_blocking(me: str, sender: str) -> dict:
     if me_lists is None or sender_lists is None:
         raise ValueError("User relationship data not found.")
 
-    # idempotent: already friends (e.g. a retry after a lost response)
     if sender in me_lists.get("friend_list", []):
+        # idempotent retry: make sure the sender-side cleanup also happened
+        all_type_list_col.update_one({"_id": sender}, {"$pull": {"outgoing_list": me}})
+        all_type_list_col.update_one({"_id": me}, {"$pull": {"incoming_list": sender, "outgoing_list": sender}})
         return {"already_friends": True}
 
-    # the request must still exist on my side
     if sender not in me_lists.get("incoming_list", []):
         raise ValueError("This friend request no longer exists.")
 
@@ -2633,17 +2693,16 @@ def _accept_friend_request_blocking(me: str, sender: str) -> dict:
         all_type_list_col.update_one({"_id": sender}, {"$pull": {"outgoing_list": me}})
         raise ValueError("This request cannot be accepted because one of you has blocked the other.")
 
-    # atomic-enough two-sided write: both lists updated together
+    # both sides in one place; outgoing on the sender side and incoming on my side are always cleared
     all_type_list_col.update_one(
         {"_id": me},
-        {"$addToSet": {"friend_list": sender}, "$pull": {"incoming_list": sender}},
+        {"$addToSet": {"friend_list": sender}, "$pull": {"incoming_list": sender, "outgoing_list": sender}},
     )
     all_type_list_col.update_one(
         {"_id": sender},
-        {"$addToSet": {"friend_list": me}, "$pull": {"outgoing_list": me}},
+        {"$addToSet": {"friend_list": me}, "$pull": {"outgoing_list": me, "incoming_list": me}},
     )
 
-    # store a notification so the sender learns about it even if offline right now
     pending_notifications_col.insert_one({
         "to_user": sender,
         "type": "request_accepted",
@@ -2653,19 +2712,23 @@ def _accept_friend_request_blocking(me: str, sender: str) -> dict:
     return {"already_friends": False}
 
 
+
+
+
 def _reject_friend_request_blocking(me: str, sender: str) -> dict:
     if me == sender:
         raise ValueError("invalid users")
 
-    me_lists = all_type_list_col.find_one({"_id": me})
-    sender_lists = all_type_list_col.find_one({"_id": sender})
-    if me_lists is None or sender_lists is None:
+    if all_type_list_col.find_one({"_id": me}) is None or all_type_list_col.find_one({"_id": sender}) is None:
         raise ValueError("User relationship data not found.")
 
-    # idempotent: if it's already gone, that's the desired end state
     all_type_list_col.update_one({"_id": me}, {"$pull": {"incoming_list": sender}})
     all_type_list_col.update_one({"_id": sender}, {"$pull": {"outgoing_list": me}})
     return {"rejected": True}
+
+
+
+
 
 
 @app.post("/accept_friend_request")
@@ -2678,15 +2741,11 @@ async def accept_friend_request(request: Request):
             return {"ok": False, "error": "invalid users"}
 
         result = await run_blocking(_accept_friend_request_blocking, me, sender)
-
-        # push to whichever side is online right now; the change-stream watcher
-        # also pushes friend_list updates, so this is just the fastest path
-        if MAIN_LOOP is not None:
-            await send_to_user(me, {"type": "friend_added", "email": sender})
-            await send_to_user(sender, {"type": "friend_added", "email": me})
-            await send_to_user(sender, {"type": "request_accepted", "by": me})
-
-        return {"ok": True, **result}
+        my_snap = await run_blocking(_relationship_snapshot, me)
+        sender_snap = await run_blocking(_relationship_snapshot, sender)
+        await _push_relationship_to_user(me, my_snap, "accepted", sender)
+        await _push_relationship_to_user(sender, sender_snap, "request_accepted", me)
+        return {"ok": True, "lists": my_snap, **result}
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     except Exception as e:
@@ -2704,14 +2763,19 @@ async def reject_friend_request(request: Request):
             return {"ok": False, "error": "invalid users"}
 
         result = await run_blocking(_reject_friend_request_blocking, me, sender)
-
-        await send_to_user(sender, {"type": "request_rejected", "by": me})
-        return {"ok": True, **result}
+        my_snap = await run_blocking(_relationship_snapshot, me)
+        sender_snap = await run_blocking(_relationship_snapshot, sender)
+        await _push_relationship_to_user(me, my_snap, "rejected", sender)
+        await _push_relationship_to_user(sender, sender_snap, "request_rejected", me)
+        return {"ok": True, "lists": my_snap, **result}
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     except Exception as e:
         print(f"[reject_friend_request] error: {e}")
         return {"ok": False, "error": str(e)}
+        
+
+
 
 
 def _pop_pending_notifications_blocking(user_email: str) -> List[dict]:
