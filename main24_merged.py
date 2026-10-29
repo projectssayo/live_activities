@@ -1,0 +1,2732 @@
+import asyncio
+import io
+import json
+import random
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlparse, unquote
+
+import cloudinary
+import cloudinary.api
+import cloudinary.uploader
+import cloudinary.utils
+import httpx
+from argon2 import PasswordHasher
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from pymongo import MongoClient, ReturnDocument, UpdateOne
+
+from email_template import create_account, forgot_password
+
+
+# ======================================================================
+# CONFIG (hard-coded)
+# ======================================================================
+
+cloudinary.config(
+    cloud_name="dbiifyr5m",
+    api_key="931832746959244",
+    api_secret="W4-z0i5yUemucfL_uBPTFoDgH00",
+    secure=True,
+)
+
+MONGO_USERNAME = "suyognegi_global"
+MONGO_PASSWORD = "Oj5eGphIUUud9YvY"
+url = f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@cluster0.hzyekeb.mongodb.net/?appName=Cluster0"
+
+
+
+BREVO_API_KEY = "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"
+SENDER_EMAIL = "suyognegi2@gmail.com"
+SENDER_NAME = "Zyro Chat"
+BREVO_URL = "https://api.brevo.com/v3/smtp/email"
+
+
+
+async def send_email_brevo(to_email: str, subject: str, html_content: str, to_name: str = "") -> None:
+    """Sends an email through Brevo. Raises an Exception if sending fails."""
+    if not BREVO_API_KEY or not SENDER_EMAIL:
+        raise RuntimeError("BREVO_API_KEY or SENDER_EMAIL is not set")
+
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
+    payload = {
+        "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+        "to": [{"email": to_email, "name": to_name or to_email}],
+        "subject": subject,
+        "htmlContent": html_content,
+    }
+
+    async with httpx.AsyncClient(timeout=15) as http_client:
+        response = await http_client.post(BREVO_URL, headers=headers, json=payload)
+
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"Brevo error {response.status_code}: {response.text}")
+
+
+# ======================================================================
+# DATABASE
+# ======================================================================
+
+client = MongoClient(
+    url,
+    serverSelectionTimeoutMS=10000,
+    connectTimeoutMS=10000,
+    socketTimeoutMS=10000,
+)
+try:
+    client.admin.command("ping")
+    print("Connected!")
+except Exception as e:
+    print(e)
+
+# user_db
+user_db = client["user_db"]
+user_table = user_db["user_table"]
+all_type_list_col = user_db["all_type_list_table"]
+all_type_list_table = all_type_list_col  # alias
+
+# otp_db
+otp_db = client["otp_db"]
+create_account_otp_table = otp_db["create_account_otp_table"]
+forgot_password_otp_table = otp_db["forgot_password_otp_table"]
+
+# live_activities
+live_activities = client["live_activities"]
+db = live_activities
+remember_me_table = live_activities["remember_me"]
+last_seen_col = live_activities["last_seen"]
+last_seen = last_seen_col  # alias
+last_clicked_col = live_activities["last_clicked_on_table"]
+last_clicked_on_table = last_clicked_col  # alias
+logged_in_col = live_activities["logged_in_at"]
+logged_in_at = logged_in_col  # alias
+currently_on_table = live_activities["currently_on_table"]
+messages_col = live_activities["messages"]
+messages_col.create_index([("sent_by", 1), ("sent_to", 1), ("sent_at", -1)])
+messages_col.create_index([("sent_to", 1), ("received_at", 1)])
+messages_col.create_index([("sent_by", 1), ("received_at", 1)])
+
+# scheduled messages
+scheduled_msg_db = client["scheduled_messages"]
+messages_to_send_col = scheduled_msg_db["messages_to_send"]
+
+
+pending_notifications_col = live_activities["pending_notifications"]
+pending_notifications_col.create_index([("to_user", 1), ("created_at", 1)])
+
+# ======================================================================
+# APP + GLOBAL STATE
+# ======================================================================
+
+app = FastAPI(title="Zyro Server")
+
+connected_users: Dict[str, Dict[str, WebSocket]] = {}
+
+HEARTBEAT_IDLE_TIMEOUT = 5.0
+HEARTBEAT_PING_TIMEOUT = 3.0
+
+presence_state: Dict[str, dict] = {}
+friend_watchers: Dict[str, Set[str]] = {}
+user_friend_lists: Dict[str, Set[str]] = {}
+last_clicked_mem: Dict[str, Dict[str, datetime]] = {}
+dirty_clicks: Dict[str, Set[str]] = {}
+
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+OTP_COOLDOWN_SECONDS = 25
+ONLINE_THRESHOLD_SECONDS = 20
+
+EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+password_hasher = PasswordHasher()
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+async def index():
+    return {
+        "success": True,
+        "/is_exist": "http://127.0.0.1:8000/is_exist?email=suyognegi1@gmail.com",
+        "/send_create_account_otp": "http://127.0.0.1:8000/send_create_account_otp?email=suyognegi1@gmail.com&ip=117.207.52.46&city=Palampur&region=Himachal%20Pradesh&country=India",
+        "/check_create_otp": "http://127.0.0.1:8000/check_create_otp?email=suyognegi1@gmail.com&input_otp=616765",
+        "/create_new_account": "http://127.0.0.1:8000/create_new_account",
+        "/send_forgot_password_otp": "http://127.0.0.1:8000/send_forgot_password_otp?email=suyognegi1@gmail.com&ip=117.207.52.46&city=Palampur&region=Himachal%20Pradesh&country=India",
+        "/check_forgot_password_otp": "http://127.0.0.1:8000/check_forgot_password_otp?email=suyognegi1@gmail.com&input_otp=616765",
+    }
+
+
+# ======================================================================
+# SHARED HELPERS
+# ======================================================================
+
+async def run_blocking(fn, *args, **kwargs):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(EXECUTOR, lambda: fn(*args, **kwargs))
+
+
+def sanitize_email(email: str) -> str:
+    return email.replace(".", "dot").replace("@", "at")
+
+
+def get_chat_id(email1: str, email2: str) -> str:
+    if email1 < email2:
+        return f"chat_{email2}_{email1}"
+    return f"chat_{email1}_{email2}"
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def hash_password(password: str) -> str:
+    return password_hasher.hash(password)
+
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    try:
+        password_hasher.verify(hashed_password, password)
+        return True
+    except Exception:
+        return False
+
+
+def _strip_private_user_fields(user_data: dict) -> dict:
+    for key in ("password", "created_on", "created_ip", "created_city", "created_region", "created_country"):
+        user_data.pop(key, None)
+    return user_data
+
+
+def _parse_iso_utc(value) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            try:
+                dt = datetime.strptime(s.split(".")[0].replace("T", " ")[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _norm_iso_utc(value) -> Optional[str]:
+    dt = _parse_iso_utc(value)
+    return dt.isoformat(timespec="microseconds") if dt else None
+
+
+def _json_safe(o):
+    if isinstance(o, datetime):
+        return o.isoformat()
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    return o
+
+
+def _iso_or_none(ts):
+    if ts is None:
+        return None
+    return ts.isoformat() if hasattr(ts, "isoformat") else ts
+
+
+# ======================================================================
+# OTP / ACCOUNT / AUTH
+# ======================================================================
+
+def _otp_cooldown_active(table, email):
+    doc = table.find_one({"_id": email}, {"sent_at": 1})
+    if not doc or not doc.get("sent_at"):
+        return False
+    sent_at = doc["sent_at"]
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - sent_at).total_seconds() < OTP_COOLDOWN_SECONDS
+
+
+@app.get("/is_exist")
+async def is_exist(email: str, mac_id: str, ip: str):
+    try:
+        u = user_table.find_one({"_id": email})
+        if u:
+            return {"success": True, "found": True, "msg": "User already exists good"}
+        return {"success": True, "found": False, "msg": "User does not exist bad"}
+
+    except Exception as e:
+        print(f"error at is_exist {e}")
+        return {"success": False, "found": None, "msg": f"Error : {e}"}
+
+
+@app.get("/send_create_account_otp")
+async def send_create_account(email: str, ip: str, city: str, region: str, country: str, mac_id: str):
+    try:
+        if _otp_cooldown_active(create_account_otp_table, email):
+            return {"success": True, "msg": "otp already sent recently, please use the one you received"}
+
+        otp = random.randint(100000, 999999)
+        html_code = create_account(otp=otp, ip=ip, city=city, region=region,
+                                   country=country, email=email).get_html()
+        now = datetime.now(timezone.utc)
+
+        create_account_otp_table.update_one(
+            {"_id": email},
+            {"$set": {"otp": f"{otp}", "sent_at": now,
+                      "valid_till": now + timedelta(minutes=5), "is_used": False}},
+            upsert=True
+        )
+
+        await send_email_brevo(to_email=email, subject="Your OTP to create your account",
+                               html_content=html_code)
+        return {"success": True, "msg": "email sent successfully"}
+    except Exception as e:
+        print(f"error in send_create_account_otp : {e}")
+        return {"success": False, "msg": "email sent failed"}
+
+
+@app.get("/check_create_otp")
+async def check_create_otp(email: str, input_otp: str, mac_id: str, ip: str):
+    try:
+        otp_data = create_account_otp_table.find_one({"_id": email})
+        if otp_data:
+            otp = otp_data["otp"]
+            if str(otp) == str(input_otp):
+                if otp_data["valid_till"].replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) and otp_data["is_used"] is False:
+                    create_account_otp_table.update_one(
+                        {"_id": email},
+                        {"$set": {"is_used": True}}
+                    )
+                    return {"success": True, "msg": "otp verified successfully otp matched"}
+                if otp_data["valid_till"].replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) and otp_data["is_used"]:
+                    return {"success": False, "msg": "otp already used"}
+                return {"success": False, "msg": "otp expired, regenerate your otp"}
+            else:
+                return {"success": False, "msg": "otp didn't matched otp verification failed"}
+
+        return {"success": False, "msg": "Error occur inside fucntion check db"}
+    except Exception as e:
+        print(f"error check_create_otp : {e}")
+        return {"success": False, "msg": f"error : {e}"}
+
+
+@app.get("/send_forgot_password_otp")
+async def send_forgot_password_otp(email: str, ip: str, city: str, region: str, country: str, mac_id: str):
+    try:
+        if _otp_cooldown_active(forgot_password_otp_table, email):
+            return {"success": True, "msg": "otp already sent recently, please use the one you received"}
+
+        otp = random.randint(100000, 999999)
+        html_code = forgot_password(otp=otp, ip=ip, city=city, region=region,
+                                    country=country, email=email).get_html()
+        now = datetime.now(timezone.utc)
+
+        forgot_password_otp_table.update_one(
+            {"_id": email},
+            {"$set": {"otp": f"{otp}", "sent_at": now,
+                      "valid_till": now + timedelta(minutes=5), "is_used": False}},
+            upsert=True
+        )
+
+        await send_email_brevo(to_email=email, subject="Your OTP to reset your password",
+                               html_content=html_code)
+        return {"success": True, "msg": "email sent successfully"}
+    except Exception as e:
+        print(f"error in send_forgot_password_otp : {e}")
+        return {"success": False, "msg": "error : email sent failed"}
+
+
+@app.get("/check_forgot_password_otp")
+async def check_forgot_password_otp(email: str, input_otp: str, mac_id: str, ip: str):
+    try:
+        otp_data = forgot_password_otp_table.find_one({"_id": email})
+        if otp_data:
+            otp = otp_data["otp"]
+            if str(otp) == str(input_otp):
+                if otp_data["valid_till"].replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) and otp_data["is_used"] is False:
+                    forgot_password_otp_table.update_one(
+                        {"_id": email},
+                        {"$set": {"is_used": True}}
+                    )
+                    return {"success": True, "msg": "otp verified successfully otp matched"}
+                if otp_data["valid_till"].replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) and otp_data["is_used"]:
+                    return {"success": False, "msg": "otp already used"}
+                return {"success": False, "msg": "otp expired, regenerate your otp"}
+            else:
+                return {"success": False, "msg": "otp didn't matched otp verification failed"}
+
+        return {"success": False, "msg": "Error occur inside fucntion check db"}
+    except Exception as e:
+        print(f"error check_forgot_password_otp : {e}")
+        return {"success": False, "msg": f"error : {e}"}
+
+
+@app.post("/create_new_account")
+async def create_new_account(request: Request):
+    try:
+        data = await request.json()
+
+        email = data["email"].strip()
+
+        if user_table.find_one({"_id": email}):
+            return {"success": False, "msg": "User already exists"}
+
+        if data["should_i_download"]:
+            image_url = "https://res.cloudinary.com/doeeoa5f1/image/upload/v1771519879/c9jixljhlwkmt7qtzxtv.png"
+        else:
+            image_bytes = bytes.fromhex(data["image_data"])
+
+            upload_result = cloudinary.uploader.upload(
+                io.BytesIO(image_bytes),
+                folder="profile_pictures",
+                format="png",
+                transformation=[
+                    {
+                        "width": 1024,
+                        "height": 1024,
+                        "crop": "fill",
+                        "gravity": "auto"
+                    },
+                    {
+                        "quality": "100"
+                    }
+                ]
+            )
+            image_url = upload_result["secure_url"]
+
+        hashed_password = hash_password(data["password"])
+
+        now = datetime.now(timezone.utc)
+
+        user_table.insert_one({
+            "_id": email,
+            "email": email,
+            "name": data["name"],
+            "password": hashed_password,
+            "pfp": image_url,
+            "created_on": data["mac_id"],
+            "created_at": now,
+            "last_pfp_update": now,
+            "last_password_update": now,
+            "created_ip": data["ip"],
+            "created_city": data["city"],
+            "created_region": data["region"],
+            "created_country": data["country"],
+            "about": "Hi i am using ZyroChat, BE YOUR SELF !!"
+        })
+        all_type_list_table.update_one(
+            {"_id": email},
+            {"$set": {"friend_list": [],
+                      "incoming_list": [],
+                      "outgoing_list": [],
+                      "blocked_list": []}},
+            upsert=True
+        )
+
+        return {
+            "success": True,
+            "msg": "Account created successfully",
+            "img_url": image_url
+        }
+
+    except Exception as e:
+        print(f"error create_new_account : {e}")
+        return {"success": False, "msg": str(e)}
+
+
+@app.get("/reset_password")
+async def reset_password(email: str, password: str, mac_id: str, ip: str):
+    try:
+        user_table.update_one(
+            {"_id": email},
+            {"$set": {
+                "password": hash_password(password),
+                "last_password_update": datetime.now(timezone.utc),
+            }}
+        )
+        return {"success": True, "message": "password reset successfully !"}
+
+    except Exception as e:
+        return {"message": str(e), "success": False}
+
+
+@app.get("/login")
+async def login(email: str, password: str, remember_me: bool, mac_id: str, ip: str):
+    try:
+        user_data = user_table.find_one({"_id": email})
+
+        if user_data is None:
+            return {"success": False, "msg": "User not found"}
+
+        if not verify_password(password, user_data["password"]):
+            return {"success": False, "msg": "Incorrect password"}
+
+        now = datetime.now(timezone.utc)
+
+        # presence fields are owned by the websocket layer (is_online / last_seen_at)
+        last_seen_col.update_one(
+            {"_id": email},
+            {"$set": {"last_seen_at": now}},
+            upsert=True
+        )
+
+        if remember_me:
+            remember_me_table.update_one(
+                {"_id": email},
+                {"$set": {"remember": True, "login_at": now, "mac_id": mac_id, "ip": ip}},
+                upsert=True
+            )
+        else:
+            remember_me_table.delete_one({"_id": email})
+
+        _strip_private_user_fields(user_data)
+
+        friend_data = all_type_list_table.find_one({"_id": email})
+        user_data["remember_me"] = remember_me
+        if friend_data:
+            user_data["friend_list"] = friend_data.get("friend_list", [])
+            user_data["incoming_list"] = friend_data.get("incoming_list", [])
+            user_data["outgoing_list"] = friend_data.get("outgoing_list", [])
+            user_data["blocked_list"] = friend_data.get("blocked_list", [])
+            logged_in_at.update_one(
+                {"_id": email},
+                {"$set": {"logged_in_at": now, "mac_id": mac_id}},
+                upsert=True
+            )
+            return {"success": True, "msg": "login successfully ! Data delivered", "data": user_data}
+
+        else:
+            return {"success": False, "msg": "something went wrong while extracting friend ist"}
+
+    except Exception as e:
+        return {
+            "success": False,
+            "msg": f"error : {e}"
+        }
+
+
+@app.get("/get_user_basic_details")
+async def get_user_basic_details(email: str, mac_id: str, ip: str):
+    user_data = user_table.find_one({"_id": email})
+    if user_data is None:
+        return {"success": False, "msg": "User not found", "data": {}}
+    _strip_private_user_fields(user_data)
+    return {"success": True, "msg": f"{email} data found. sending you his data", "data": user_data}
+
+
+@app.get("/get_bulk_data_of_all_list")
+async def get_bulk_data_of_all_list(email: str, mac_id: str, ip: str):
+    try:
+        friend_data = all_type_list_table.find_one({"_id": email})
+
+        if not friend_data:
+            return {
+                "success": False,
+                "data": [],
+                "msg": "soemthing is wrong 443 init didnt exist"
+            }
+
+        l = []
+        l.extend(friend_data.get("friend_list", []))
+        l.extend(friend_data.get("incoming_list", []))
+        l.extend(friend_data.get("outgoing_list", []))
+        l.extend(friend_data.get("blocked_list", []))
+        result = []
+        for i in l:
+            user_data = user_table.find_one({"_id": i})
+            if user_data is None:
+                continue
+            _strip_private_user_fields(user_data)
+            result.append(user_data)
+
+        return {
+            "success": True,
+            "data": result,
+            "msg": "success returned value"
+        }
+    except Exception as e:
+        return {"success": False, "msg": f"error : {e}", "data": []}
+
+
+@app.get("/check_remember_me")
+async def check_remember_me(mac_id: str, email: str):
+    try:
+        remember_data = remember_me_table.find_one({"_id": email})
+
+        if remember_data is None:
+            return {"success": True, "auto_login": False, "msg": "Remember me record not found."}
+
+        if remember_data["mac_id"] != mac_id:
+            return {"success": True, "auto_login": False, "msg": "Device does not match."}
+
+        if remember_data["remember"] == False:
+            return {"success": True, "auto_login": False, "msg": "Remember me is disabled."}
+
+        login_data = logged_in_at.find_one({"_id": email})
+
+        if login_data is None:
+            return {"success": True, "auto_login": False, "msg": "No active login found."}
+
+        if login_data["mac_id"] != mac_id:
+            return {"success": True, "auto_login": False, "msg": "User is logged in on another device."}
+
+        return {"success": True, "auto_login": True, "msg": "Auto login allowed."}
+
+    except Exception as e:
+        return {
+            "success": False,
+            "auto_login": False,
+            "msg": f"Error: {e}"
+        }
+
+
+@app.get("/remove_remember_me")
+def remove_remember_me(mac_id: str, email: str):
+    remember_me_table.delete_one({
+        "_id": email,
+        "mac_id": mac_id
+    })
+
+    logged_in_at.delete_one({
+        "_id": email,
+        "mac_id": mac_id
+    })
+
+    return {
+        "success": True,
+        "message": "Remember me and login records removed."
+    }
+
+
+@app.post("/update_current_user_basic_info")
+async def update_current_user_basic_info(request: Request):
+    try:
+        data = await request.json()
+
+        previous_url = data.get("previous_url", "None")
+
+        update_fields = {
+            "name": data["name"],
+            "about": data["about"]
+        }
+
+        if data.get("should_change"):
+
+            if "image_data" not in data or not data["image_data"]:
+                if previous_url != "None":
+                    update_fields["pfp"] = previous_url
+                else:
+                    return {
+                        "success": False,
+                        "msg": "No image provided and no previous URL found."
+                    }
+            else:
+                image_bytes = bytes.fromhex(data["image_data"])
+                print("DEBUG image_bytes size:", len(image_bytes))
+
+                buffer = io.BytesIO(image_bytes)
+                buffer.seek(0)
+
+                upload_result = cloudinary.uploader.upload(
+                    buffer,
+                    folder="profile_pictures",
+                    format="png",
+                    resource_type="image",
+                    transformation=[
+                        {"width": 530, "height": 530, "crop": "fill", "gravity": "auto"},
+                        {"quality": "auto:good"}
+                    ]
+                )
+
+                print("UPLOAD RESULT:", upload_result)
+
+                update_fields["pfp"] = upload_result.get("secure_url")
+                update_fields["last_pfp_update"] = datetime.now(timezone.utc)
+
+        result = user_table.update_one(
+            {"_id": data["email"]},
+            {"$set": update_fields}
+        )
+
+        if result.matched_count == 0:
+            return {
+                "success": False,
+                "msg": "User not found."
+            }
+
+        return {
+            "success": True,
+            "msg": "Profile updated successfully.",
+            "img_url": update_fields.get("pfp", previous_url),
+            "last_pfp_update": update_fields.get("last_pfp_update")
+        }
+
+    except Exception as e:
+        print("DEBUG ERROR:", str(e))
+        return {
+            "success": False,
+            "msg": f"error: {e}"
+        }
+
+
+@app.get("/confirm_and_reset_password")
+def confirm_and_reset_password(email: str, old_password: str, new_password: str, mac_id: str, ip: str):
+    try:
+        user = user_table.find_one({"_id": email})
+        current_time = datetime.now(timezone.utc)
+        if user is None:
+            return {
+                "success": False,
+                "msg": "User not found."
+            }
+
+        if not verify_password(old_password, user["password"]):
+            return {
+                "success": False,
+                "msg": "Old password is incorrect."
+            }
+
+        if old_password == new_password:
+            return {
+                "success": False,
+                "msg": "New password cannot be the same as the old password."
+            }
+
+        hashed_password = hash_password(new_password)
+
+        user_table.update_one(
+            {"_id": email},
+            {
+                "$set": {
+                    "password": hashed_password,
+                    "last_password_update": current_time
+                }
+            }
+        )
+
+        return {
+            "success": True,
+            "msg": "Password updated successfully.",
+            "updated_at": current_time.isoformat()
+        }
+
+    except Exception as e:
+        print(f"Error in confirm_and_reset_password: {e}")
+        return {
+            "success": False,
+            "msg": "An unexpected error occurred."
+        }
+
+
+# ======================================================================
+# FRIENDS / REQUESTS / BLOCKING
+# ======================================================================
+
+@app.get("/search_user_for_send_request")
+def search_user_for_send_request(current_user: str, to: str, mac_id: str, ip: str):
+    try:
+        if current_user == to:
+            return {"success": False, "msg": "You cannot search yourself.", "data": {}}
+
+        user_data = user_table.find_one({"_id": to})
+
+        if user_data is None:
+            return {"success": False, "msg": "User not found.", "data": {}}
+
+        current_lists = all_type_list_table.find_one({"_id": current_user})
+        target_lists = all_type_list_table.find_one({"_id": to})
+
+        if current_lists is None or target_lists is None:
+            return {"success": False, "msg": "User relationship data not found.", "data": {}}
+
+        if to in current_lists.get("blocked_list", []):
+            return {"success": False, "msg": "You have blocked this user.", "data": {}}
+
+        if current_user in target_lists.get("blocked_list", []):
+            return {"success": False, "msg": "You are blocked by this user.", "data": {}}
+
+        _strip_private_user_fields(user_data)
+
+        if to in current_lists.get("friend_list", []):
+            status = "friend"
+        elif to in current_lists.get("incoming_list", []):
+            status = "incoming"
+        elif to in current_lists.get("outgoing_list", []):
+            status = "outgoing"
+        else:
+            status = "none"
+
+        user_data["status"] = status
+
+        return {"success": True, "msg": "User found.", "data": user_data}
+
+    except Exception as e:
+        return {"success": False, "msg": f"Error: {e}", "data": {}}
+
+
+@app.post("/send_friend_request")
+def send_friend_request(from_user: str, to_: str, mac_id: str, ip: str):
+    try:
+        if from_user == to_:
+            return {"server": True, "success": False, "msg": "You cannot send a friend request to yourself."}
+
+        from_user_data = user_table.find_one({"_id": from_user})
+        to_user_data = user_table.find_one({"_id": to_})
+
+        if from_user_data is None or to_user_data is None:
+            return {"server": True, "success": False, "msg": "User not found."}
+
+        from_lists = all_type_list_table.find_one({"_id": from_user})
+        to_lists = all_type_list_table.find_one({"_id": to_})
+
+        if from_lists is None or to_lists is None:
+            return {"server": True, "success": False, "msg": "User relationship data not found."}
+
+        if to_ in from_lists.get("blocked_list", []):
+            return {"server": True, "success": False, "msg": "You have blocked this user."}
+
+        if from_user in to_lists.get("blocked_list", []):
+            return {"server": True, "success": False, "msg": "You are blocked by this user."}
+
+        if to_ in from_lists.get("friend_list", []):
+            return {"server": True, "success": False, "msg": "This user is already your friend."}
+
+        if to_ in from_lists.get("outgoing_list", []):
+            return {"server": True, "success": False, "msg": "Friend request already sent."}
+
+        if to_ in from_lists.get("incoming_list", []) or from_user in to_lists.get("outgoing_list", []):
+            return {"server": True, "success": False, "msg": "This user has already sent you a friend request."}
+
+        all_type_list_table.update_one({"_id": from_user}, {"$addToSet": {"outgoing_list": to_}})
+        all_type_list_table.update_one({"_id": to_}, {"$addToSet": {"incoming_list": from_user}})
+
+        return {"server": True, "success": True, "msg": "Friend request sent successfully."}
+
+    except Exception as e:
+        return {"server": False, "success": False, "msg": f"error {e}"}
+
+
+@app.post("/retract_friend_request")
+def retract_friend_request(from_user: str, to_: str, mac_id: str, ip: str):
+    try:
+        if from_user == to_:
+            return {"server": True, "success": False, "msg": "you cannot retract a request to yourself"}
+
+        from_user_data = user_table.find_one({"_id": from_user})
+        to_user_data = user_table.find_one({"_id": to_})
+
+        if from_user_data is None or to_user_data is None:
+            return {"server": True, "success": False, "msg": "user not found"}
+
+        from_lists = all_type_list_table.find_one({"_id": from_user})
+        to_lists = all_type_list_table.find_one({"_id": to_})
+        if from_lists is None or to_lists is None:
+            return {"server": True, "success": False, "msg": "user relationship data not found"}
+
+        if from_user in to_lists.get("blocked_list", []):
+            all_type_list_table.update_one({"_id": from_user}, {"$pull": {"outgoing_list": to_}})
+            all_type_list_table.update_one({"_id": to_}, {"$pull": {"incoming_list": from_user}})
+            return {"server": True, "success": False, "msg": "you are blocked by this user",
+                    "data": {"reason": "blocked", "action_taken": "cleaned_up_request"}}
+
+        if to_ not in from_lists.get("outgoing_list", []):
+            return {"server": True, "success": False, "msg": "no outgoing friend request found to this user",
+                    "data": {"reason": "not_found"}}
+
+        if from_user not in to_lists.get("incoming_list", []):
+            return {"server": True, "success": False, "msg": "recipient does not have this incoming request"}
+
+        all_type_list_table.update_one({"_id": from_user}, {"$pull": {"outgoing_list": to_}})
+        all_type_list_table.update_one({"_id": to_}, {"$pull": {"incoming_list": from_user}})
+
+        return {"server": True, "success": True, "msg": "friend request retracted successfully",
+                "data": {"from_user": from_user, "to_user": to_, "action": "retracted"}}
+
+    except Exception as e:
+        return {"server": False, "success": False, "msg": f"error {e}"}
+
+
+# ---- block / unblock (unified: accepts both the old and the new request shapes) ----
+
+async def _read_request_params(request: Request) -> dict:
+    """Merges query params and (optional) JSON body into one dict."""
+    data = dict(request.query_params)
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            data.update(body)
+    except Exception:
+        pass
+    return data
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def _block_unblock_response(ok: bool, msg: str, data: Optional[dict] = None, **extra) -> dict:
+    out = {
+        "ok": ok,
+        "success": ok,
+        "server": True,
+        "msg": msg,
+        "data": data or {},
+    }
+    if not ok:
+        out["error"] = msg
+    out.update(extra)
+    return out
+
+
+def _block_user_blocking(blocker: str, blocked: str, report: bool, reason: Optional[str]):
+    if not user_table.find_one({"_id": blocker}) or not user_table.find_one({"_id": blocked}):
+        raise ValueError("User not found.")
+
+    blocker_lists = all_type_list_col.find_one({"_id": blocker})
+    blocked_lists = all_type_list_col.find_one({"_id": blocked})
+    if blocker_lists is None or blocked_lists is None:
+        raise ValueError("User relationship data not found.")
+
+    if blocked in blocker_lists.get("blocked_list", []):
+        raise ValueError("This user is already blocked.")
+
+    all_type_list_col.update_one(
+        {"_id": blocker},
+        {
+            "$addToSet": {"blocked_list": blocked},
+            "$pull": {
+                "friend_list": blocked,
+                "incoming_list": blocked,
+                "outgoing_list": blocked,
+            },
+        },
+    )
+    all_type_list_col.update_one(
+        {"_id": blocked},
+        {"$pull": {
+            "friend_list": blocker,
+            "incoming_list": blocker,
+            "outgoing_list": blocker,
+        }},
+    )
+
+    if report:
+        evidence = [
+            d["_id"]
+            for d in messages_col.find({"sent_by": blocked, "sent_to": blocker}, {"_id": 1})
+            .sort("sent_at", -1)
+            .limit(20)
+        ]
+        user_db["reports"].update_one(
+            {"reporter": blocker, "reported": blocked, "status": "open"},
+            {
+                "$set": {
+                    "reason": reason or "unspecified",
+                    "chat_id": get_chat_id(blocker, blocked),
+                    "evidence_message_ids": evidence,
+                },
+                "$setOnInsert": {"created_at": now_utc().isoformat(timespec="microseconds")},
+            },
+            upsert=True,
+        )
+
+
+def _unblock_user_blocking(blocker: str, blocked: str):
+    if not user_table.find_one({"_id": blocker}):
+        raise ValueError(f"User {blocker} does not exist")
+    if not user_table.find_one({"_id": blocked}):
+        raise ValueError(f"User {blocked} does not exist")
+
+    lists = all_type_list_col.find_one({"_id": blocker})
+    if not lists:
+        raise ValueError(f"User {blocker} has no block list")
+    if blocked not in lists.get("blocked_list", []):
+        raise ValueError(f"User {blocked} is not blocked by {blocker}")
+
+    res = all_type_list_col.update_one({"_id": blocker}, {"$pull": {"blocked_list": blocked}})
+    if res.matched_count == 0:
+        raise ValueError("user not found")
+
+
+@app.post("/block_user")
+async def block_user(request: Request):
+    try:
+        data = await _read_request_params(request)
+        blocker = data.get("blocker") or data.get("from_user")
+        blocked = data.get("blocked") or data.get("to_") or data.get("to_user")
+
+        if not blocker or not blocked:
+            return _block_unblock_response(False, "invalid users")
+        if blocker == blocked:
+            return _block_unblock_response(False, "You cannot block yourself.")
+
+        await run_blocking(
+            _block_user_blocking,
+            blocker,
+            blocked,
+            _as_bool(data.get("report", False)),
+            data.get("reason"),
+        )
+        return _block_unblock_response(True, "User blocked successfully.")
+    except ValueError as e:
+        return _block_unblock_response(False, str(e))
+    except Exception as e:
+        print(f"[block_user] error: {e}")
+        return {"ok": False, "success": False, "server": False, "msg": f"error {e}", "error": str(e)}
+
+
+@app.post("/unblock_user")
+async def unblock_user(request: Request):
+    try:
+        data = await _read_request_params(request)
+        blocker = data.get("blocker") or data.get("from_user")
+        blocked = data.get("blocked") or data.get("to_") or data.get("to_user")
+
+        if not blocker or not blocked:
+            return _block_unblock_response(False, "invalid users")
+
+        await run_blocking(_unblock_user_blocking, blocker, blocked)
+        return _block_unblock_response(
+            True,
+            f"User {blocked} unblocked successfully by {blocker}",
+            data={"from_user": blocker, "to_user": blocked},
+        )
+    except ValueError as e:
+        return _block_unblock_response(False, str(e))
+    except Exception as e:
+        print(f"[unblock_user] error: {e}")
+        return {"ok": False, "success": False, "server": True, "msg": str(e), "error": str(e), "data": {}}
+
+
+@app.get("/watch_any_request")
+def watch_user(email: str, mac_id: str, ip: str):
+    pipeline = [
+        {"$match": {"operationType": "update"}},
+        {"$match": {"documentKey._id": email}},
+        {"$project": {"updatedFields": "$updateDescription.updatedFields"}}
+    ]
+
+    def event_stream():
+        retry_count = 0
+        max_retries = 10
+
+        while True:
+            try:
+                retry_count = 0
+
+                with all_type_list_table.watch(pipeline) as stream:
+                    for change in stream:
+                        updated = change["updatedFields"]
+
+                        for updated_key in updated.keys():
+                            for field in ["friend_list", "incoming_list", "outgoing_list", "blocked_list"]:
+                                if updated_key.startswith(field):
+                                    value = updated[updated_key]
+
+                                    data = {
+                                        "type": field,
+                                        "data": value
+                                    }
+
+                                    if isinstance(value, list):
+                                        data["kind"] = "delete"
+                                    elif isinstance(value, str):
+                                        data["kind"] = "insert"
+
+                                    yield f"data: {json.dumps(data)}\n\n"
+
+            except GeneratorExit:
+                break
+            except Exception:
+                retry_count += 1
+
+                if retry_count > max_retries:
+                    break
+
+                delay = min(3 * (2 ** (retry_count - 1)) + random.uniform(0, 0.3), 60)
+                time.sleep(delay)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ======================================================================
+# PRESENCE / SSE WATCHERS / CLICK TRACKING / CURRENTLY-ON
+# ======================================================================
+
+def is_user_online(email: str) -> bool:
+    if email in connected_users:
+        return True
+    state = presence_state.get(email)
+    if state is not None:
+        return bool(state.get("is_online"))
+    doc = last_seen_col.find_one({"_id": email})
+    if not doc or not doc.get("last_seen_at"):
+        return False
+    ts = doc["last_seen_at"]
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() <= ONLINE_THRESHOLD_SECONDS
+
+
+@app.websocket("/ws/presence")
+async def ws_presence(websocket: WebSocket, email: str, mac_id: str):
+    # Same behaviour as the main websocket (/ws/{email}/{mac_id}); kept for older clients.
+    await websocket_endpoint(websocket, email, mac_id)
+
+
+@app.get("/watch_login_mac_id")
+def watch_login_mac_id(email: str, mac_id: str):
+    pipeline = [
+        {"$match": {"operationType": {"$in": ["insert", "update", "replace"]}}},
+        {"$match": {"documentKey._id": email}},
+    ]
+
+    def event_stream():
+        retry_count = 0
+        while True:
+            try:
+                retry_count = 0
+                with logged_in_at.watch(pipeline, full_document="updateLookup") as stream:
+                    for change in stream:
+                        doc = change["fullDocument"]
+                        server_mac_id = doc.get("mac_id")
+                        yield f"data: {json.dumps({'mac_id': server_mac_id, 'matched': server_mac_id == mac_id})}\n\n"
+            except GeneratorExit:
+                break
+            except Exception:
+                retry_count += 1
+                if retry_count > 10:
+                    break
+                time.sleep(min(3 * (2 ** (retry_count - 1)) + random.uniform(0, 0.3), 60))
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/watch_friends_last_seen")
+def watch_friends_last_seen(email: str):
+    friend_data = all_type_list_table.find_one({"_id": email})
+    friend_ids = friend_data.get("friend_list", []) if friend_data else []
+    pipeline = [
+        {"$match": {"operationType": {"$in": ["insert", "update", "replace"]}}},
+        {"$match": {"documentKey._id": {"$in": friend_ids}}},
+    ]
+
+    def event_stream():
+        retry_count = 0
+        while True:
+            try:
+                retry_count = 0
+                with last_seen_col.watch(pipeline, full_document="updateLookup") as stream:
+                    for change in stream:
+                        doc = change["fullDocument"]
+                        payload = {
+                            "email": doc["_id"],
+                            "online": doc.get("is_online"),
+                            "last_seen": _iso_or_none(doc.get("last_seen_at"))
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+            except GeneratorExit:
+                break
+            except Exception:
+                retry_count += 1
+                if retry_count > 10:
+                    break
+                time.sleep(min(3 * (2 ** (retry_count - 1)) + random.uniform(0, 0.3), 60))
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/update_last_clicked_on")
+async def update_last_clicked_on(email: str, other_email: str, mac_id: str, ip: str):
+    try:
+        chat_id = get_chat_id(email, other_email)
+        now = datetime.now(timezone.utc)
+        field_key = sanitize_email(email)
+
+        last_clicked_col.update_one(
+            {"_id": chat_id},
+            {"$set": {field_key: now}},
+            upsert=True
+        )
+        return {"success": True, "msg": "last_clicked_on updated", "chat_id": chat_id}
+    except Exception as e:
+        return {"success": False, "msg": f"error: {e}"}
+
+
+@app.get("/get_last_clicked_on")
+async def get_last_clicked_on(email: str, other_email: str, mac_id: str, ip: str):
+    try:
+        chat_id = get_chat_id(email, other_email)
+        doc = last_clicked_col.find_one({"_id": chat_id})
+        if not doc:
+            return {"success": True, "found": False, "data": {}}
+
+        my_ts = doc.get(sanitize_email(email))
+        other_ts = doc.get(sanitize_email(other_email))
+
+        return {
+            "success": True,
+            "found": True,
+            "data": {"my_last_clicked_at": my_ts, "other_last_clicked_at": other_ts}
+        }
+    except Exception as e:
+        return {"success": False, "msg": f"error: {e}"}
+
+
+@app.get("/watch_last_clicked_on")
+def watch_last_clicked_on(email: str, other_email: str):
+    chat_id = get_chat_id(email, other_email)
+    other_field = sanitize_email(other_email)
+
+    pipeline = [
+        {"$match": {"operationType": {"$in": ["insert", "update", "replace"]}}},
+        {"$match": {"documentKey._id": chat_id}},
+    ]
+
+    def event_stream():
+        retry_count = 0
+        while True:
+            try:
+                retry_count = 0
+                with last_clicked_col.watch(pipeline, full_document="updateLookup") as stream:
+                    for change in stream:
+                        doc = change["fullDocument"]
+                        ts = doc.get(other_field)
+                        yield f"data: {json.dumps({'other_last_clicked_at': _iso_or_none(ts)})}\n\n"
+            except GeneratorExit:
+                break
+            except Exception:
+                retry_count += 1
+                if retry_count > 10:
+                    break
+                time.sleep(min(3 * (2 ** (retry_count - 1)) + random.uniform(0, 0.3), 60))
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/set_currently_on")
+async def set_currently_on(email: str, currently_on: str, mac_id: str, ip: str):
+    try:
+        currently_on_table.update_one(
+            {"_id": email},
+            {"$set": {"currently_on": currently_on, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True
+        )
+        return {"success": True, "msg": "currently_on updated"}
+    except Exception as e:
+        return {"success": False, "msg": f"error: {e}"}
+
+
+@app.get("/clear_currently_on")
+async def clear_currently_on(email: str, mac_id: str, ip: str):
+    try:
+        currently_on_table.update_one(
+            {"_id": email},
+            {"$set": {"currently_on": None, "updated_at": datetime.now(timezone.utc)}}
+        )
+        return {"success": True, "msg": "currently_on cleared"}
+    except Exception as e:
+        return {"success": False, "msg": f"error: {e}"}
+
+
+# ======================================================================
+# LIVE SERVICE: scheduled messages
+# ======================================================================
+
+_IMG_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}
+
+
+def _cloud_public_id_from_url(url: str) -> Optional[str]:
+    try:
+        path = unquote(urlparse(url).path)
+        if "/upload/" not in path:
+            return None
+        parts = [p for p in path.split("/upload/", 1)[1].split("/") if p]
+        idx = next((i for i, p in enumerate(parts) if re.fullmatch(r"v\d+", p)), -1)
+        parts = parts[idx + 1:]
+        if not parts:
+            return None
+        parts[-1] = parts[-1].rsplit(".", 1)[0]
+        return "/".join(parts)
+    except Exception:
+        return None
+
+
+def _url_extension(url: str) -> str:
+    last = urlparse(url).path.rsplit("/", 1)[-1]
+    ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
+    return ext if ext in _IMG_EXTS else "jpg"
+
+
+def _build_scheduled_image_fields(content_url: str, public_id: Optional[str]):
+    public_id = public_id or _cloud_public_id_from_url(content_url)
+    if not public_id:
+        return content_url, None, None
+
+    fmt = _url_extension(content_url)
+    thumb_url, _ = cloudinary.utils.cloudinary_url(
+        public_id, secure=True, resource_type="image", type="upload",
+        format=fmt, width=1200, crop="limit", quality="auto:good",
+    )
+
+    width = height = None
+    try:
+        info = cloudinary.api.resource(public_id, resource_type="image")
+        width, height = int(info["width"]), int(info["height"])
+    except Exception as e:
+        print(f"[scheduled->message] could not read image size for {public_id}: {e}")
+    return thumb_url, width, height
+
+
+_SCHEDULED_TYPES = {"text", "sticker", "gif", "image"}
+
+
+def _transform_scheduled_to_message(doc: dict, delivered_at: str) -> dict:
+    sender = doc.get("from")
+    receiver = doc.get("to")
+    mtype = doc.get("message_type")
+    content = doc.get("message_content")
+
+    if not sender or not receiver:
+        raise ValueError("missing from/to")
+    if mtype not in _SCHEDULED_TYPES:
+        raise ValueError(f"unsupported message_type {mtype!r}")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("empty message_content")
+
+    thumbnail_url = width = height = None
+    if mtype == "image":
+        if not content.startswith(("http://", "https://")):
+            raise ValueError("image not uploaded to cloud yet")
+        thumbnail_url, width, height = _build_scheduled_image_fields(content, doc.get("cloud_public_id"))
+
+    hold_reason = _hold_reason_blocking(sender, receiver)
+    dfm = _default_dfm(sender, receiver)
+    if hold_reason:
+        dfm[sanitize_email(receiver)] = True
+
+    return {
+        "_id": doc["_id"],
+        "delete_from_all": False,
+        "delete_from_me": dfm,
+        "height": height,
+        "is_edited": False,
+        "msg_content": content,
+        "msg_type": mtype,
+        "received_at": delivered_at,
+        "sent_at": delivered_at,
+        "sent_by": sender,
+        "sent_to": receiver,
+        "thumbnail_url": thumbnail_url,
+        "width": width,
+        "held_reason": hold_reason,
+    }
+
+
+def _process_scheduled_messages_blocking(limit: int = 200) -> dict:
+    now = now_utc()
+    now_iso = now.isoformat(timespec="microseconds")
+
+    due = list(
+        messages_to_send_col.find({"sent": {"$ne": True}, "scheduled_at": {"$lte": now_iso}})
+        .sort("scheduled_at", 1)
+        .limit(limit)
+    )
+
+    moved, failed = [], []
+    for d in due:
+        _id = d.get("_id")
+        try:
+            scheduled = _parse_iso_utc(d.get("scheduled_at"))
+            if scheduled is None or scheduled > now:
+                continue
+
+            delivered_at = now_utc().isoformat(timespec="microseconds")
+            msg = _transform_scheduled_to_message(d, delivered_at)
+            msg_id = msg.pop("_id")
+
+            saved = messages_col.find_one_and_update(
+                {"_id": msg_id},
+                {"$setOnInsert": msg},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+                projection={"sent_at": 1},
+            ) or {}
+
+            messages_to_send_col.update_one(
+                {"_id": _id},
+                {"$set": {"sent": True, "sent_at": saved.get("sent_at") or delivered_at}},
+            )
+            moved.append(_id)
+        except Exception as e:
+            print(f"[process_scheduled] failed for {_id}: {e}")
+            failed.append({"_id": _id, "error": str(e)})
+
+    return {"checked": len(due), "moved": moved, "failed": failed}
+
+
+# ======================================================================
+# LIVE SERVICE: messages
+# ======================================================================
+
+def _dfm_path(email: str) -> str:
+    return f"delete_from_me.{sanitize_email(email)}"
+
+
+def _default_dfm(a: str, b: str) -> Dict[str, bool]:
+    return {sanitize_email(a): False, sanitize_email(b): False}
+
+
+def _hold_reason_blocking(sender: str, receiver: str) -> Optional[str]:
+    if not sender or not receiver or sender == receiver:
+        return None
+    doc = all_type_list_col.find_one({"_id": receiver}, {"friend_list": 1, "blocked_list": 1})
+    if not doc:
+        return None
+    if sender in (doc.get("blocked_list") or []):
+        return "block"
+    if sender not in (doc.get("friend_list") or []):
+        return "unfriend"
+    return None
+
+
+def _save_message_blocking(msg: dict):
+    server_ts = now_utc().isoformat(timespec="microseconds")
+    insert_only_keys = ("is_edited", "delete_from_all")
+    insert_only = {k: msg[k] for k in insert_only_keys if k in msg}
+
+    raw_dfm = msg.get("delete_from_me")
+    if isinstance(raw_dfm, dict):
+        sender_deleted = bool(raw_dfm.get(sanitize_email(msg["sent_by"])))
+    else:
+        sender_deleted = bool(raw_dfm)
+
+    hold_reason = _hold_reason_blocking(msg["sent_by"], msg["sent_to"])
+
+    dfm = _default_dfm(msg["sent_by"], msg["sent_to"])
+    if sender_deleted:
+        dfm[sanitize_email(msg["sent_by"])] = True
+    if hold_reason:
+        dfm[sanitize_email(msg["sent_to"])] = True
+    insert_only["delete_from_me"] = dfm
+    insert_only["held_reason"] = hold_reason
+
+    doc = {
+        k: v for k, v in msg.items()
+        if k not in ("_id", "received_at", "delete_from_me", "held_reason")
+        and k not in insert_only_keys
+    }
+
+    saved = messages_col.find_one_and_update(
+        {"_id": msg["_id"]},
+        {"$set": doc, "$setOnInsert": {"received_at": server_ts, **insert_only}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+        projection={"received_at": 1, "held_reason": 1},
+    ) or {}
+
+    if sender_deleted:
+        messages_col.update_one({"_id": msg["_id"]}, {"$set": {_dfm_path(msg["sent_by"]): True}})
+
+    return (saved.get("received_at") or server_ts), saved.get("held_reason")
+
+
+def _eff_expr(viewer: str):
+    return {"$cond": [{"$eq": ["$sent_by", viewer]}, "$sent_at", {"$ifNull": ["$received_at", "$sent_at"]}]}
+
+
+def _get_messages_page_blocking(user_a: str, user_b: str, before_sent_at, limit: int = 10):
+    match = {
+        "$or": [{"sent_by": user_a, "sent_to": user_b}, {"sent_by": user_b, "sent_to": user_a}],
+        _dfm_path(user_a): {"$ne": True},
+    }
+    pipeline = [{"$match": match}, {"$addFields": {"_eff": _eff_expr(user_a)}}]
+    if before_sent_at:
+        pipeline.append({"$match": {"_eff": {"$lt": before_sent_at}}})
+    pipeline += [{"$sort": {"_eff": -1}}, {"$limit": limit}, {"$project": {"_eff": 0}}]
+    docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
+    docs.reverse()
+    return docs
+
+
+def _mark_deleted_for_all_blocking(msg_id: str):
+    messages_col.update_one({"_id": msg_id}, {"$set": {"delete_from_all": True}})
+
+
+def _mark_deleted_for_me_blocking(msg_id: str, who: str):
+    messages_col.update_one({"_id": msg_id}, {"$set": {_dfm_path(who): True}})
+
+
+def _edit_message_blocking(msg_id: str, new_content: str):
+    messages_col.update_one({"_id": msg_id}, {"$set": {"msg_content": new_content, "is_edited": True}})
+
+
+def _get_held_reason_blocking(msg_id: str) -> Optional[str]:
+    doc = messages_col.find_one({"_id": msg_id}, {"held_reason": 1})
+    return (doc or {}).get("held_reason")
+
+
+def _release_unfriend_held_blocking(a: str, b: str) -> List[dict]:
+    released = []
+    for sender, receiver in ((a, b), (b, a)):
+        q = {"sent_by": sender, "sent_to": receiver, "held_reason": "unfriend", "delete_from_all": {"$ne": True}}
+        for d in list(messages_col.find(q, {"_id": 1}).sort("sent_at", 1)):
+            stamp = now_utc().isoformat(timespec="microseconds")
+            messages_col.update_one(
+                {"_id": d["_id"]},
+                {"$set": {_dfm_path(receiver): False, "held_reason": None, "received_at": stamp}},
+            )
+            fresh = messages_col.find_one({"_id": d["_id"]})
+            if fresh:
+                released.append(fresh)
+    return released
+
+
+def _unfriend_user_blocking(user: str, friend: str):
+    res = all_type_list_col.update_one({"_id": user}, {"$pull": {"friend_list": friend}})
+    if res.matched_count == 0:
+        raise ValueError("user not found")
+
+
+def _clear_chat_blocking(user: str, friend: str, before: Optional[str] = None) -> int:
+    q = {
+        "$or": [{"sent_by": user, "sent_to": friend}, {"sent_by": friend, "sent_to": user}],
+        _dfm_path(user): {"$ne": True},
+    }
+    cutoff = _norm_iso_utc(before) if before else None
+    if cutoff:
+        q = {"$and": [q, {"$or": [
+            {"sent_by": user, "sent_at": {"$lte": cutoff}},
+            {"sent_by": friend, "received_at": {"$lte": cutoff}},
+        ]}]}
+    res = messages_col.update_many(q, {"$set": {_dfm_path(user): True}})
+    return res.modified_count
+
+
+# ======================================================================
+# LIVE SERVICE: API push dedupe, clicks, presence persistence
+# ======================================================================
+
+recent_api_pushes: Dict[str, float] = {}
+API_PUSH_TTL = 15.0
+
+
+def _mark_api_push(kind: str, key: str):
+    now = time.monotonic()
+    recent_api_pushes[f"{kind}:{key}"] = now
+    if len(recent_api_pushes) > 2000:
+        for k, t in list(recent_api_pushes.items()):
+            if now - t > API_PUSH_TTL:
+                recent_api_pushes.pop(k, None)
+
+
+def _was_api_pushed(kind: str, key: str) -> bool:
+    t = recent_api_pushes.get(f"{kind}:{key}")
+    return t is not None and (time.monotonic() - t) < API_PUSH_TTL
+
+
+def _remember_click(viewer: str, peer: str, ts: datetime):
+    chat_id = get_chat_id(viewer, peer)
+    last_clicked_mem.setdefault(chat_id, {})[sanitize_email(viewer)] = ts
+    dirty_clicks.setdefault(viewer, set()).add(chat_id)
+
+
+def _flush_clicks_blocking(email: str):
+    field = sanitize_email(email)
+    for chat_id in list(dirty_clicks.pop(email, ())):
+        ts = last_clicked_mem.get(chat_id, {}).get(field)
+        if ts:
+            last_clicked_col.update_one({"_id": chat_id}, {"$max": {field: ts}}, upsert=True)
+
+
+def _presence_fields(email: str, viewer: str) -> dict:
+    s = presence_state.get(email, {})
+    return {
+        "is_online": s.get("is_online", False),
+        "last_seen_at": s.get("last_seen_at"),
+        "on_chat_with_you": bool(s.get("is_online") and s.get("user_is_on") == viewer),
+    }
+
+
+LEGACY_PRESENCE_FIELDS = {"online": "", "last_seen": "", "user_is_on": ""}
+
+
+def _strip_legacy_presence_fields_blocking():
+    last_seen_col.update_many({}, {"$unset": LEGACY_PRESENCE_FIELDS})
+
+
+def _create_friend_list_index_blocking():
+    all_type_list_col.create_index("friend_list")
+
+
+def _persist_user_online_blocking(email: str, ts: datetime):
+    last_seen_col.update_one(
+        {"_id": email},
+        {"$set": {"is_online": True, "last_seen_at": ts}, "$unset": LEGACY_PRESENCE_FIELDS},
+        upsert=True,
+    )
+
+
+def _persist_user_offline_blocking(email: str, ts: datetime):
+    last_seen_col.update_one(
+        {"_id": email},
+        {"$set": {"is_online": False, "last_seen_at": ts}, "$unset": LEGACY_PRESENCE_FIELDS},
+        upsert=True,
+    )
+
+
+def _persist_chat_target_blocking(email: str, target_email: Optional[str]):
+    last_seen_col.update_one({"_id": email}, {"$set": {"user_is_on": target_email}}, upsert=True)
+
+
+def _persist_last_clicked_blocking(email: str, target_email: str, ts: datetime):
+    chat_id = get_chat_id(email, target_email)
+    field = sanitize_email(email)
+    other_field = sanitize_email(target_email)
+    last_clicked_col.update_one({"_id": chat_id}, {"$set": {field: ts}}, upsert=True)
+    last_clicked_col.update_one({"_id": chat_id, other_field: {"$exists": False}}, {"$set": {other_field: None}})
+
+
+def _push_last_clicked_batch_blocking(entries: List[dict]) -> List[str]:
+    ops = []
+    chat_ids = []
+    for entry in entries:
+        chat_id = entry.get("chat_id")
+        updates = entry.get("updates") or {}
+        if not chat_id or not updates:
+            continue
+
+        parsed = {}
+        for field, value in updates.items():
+            if not value:
+                continue
+
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                parsed[field] = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+        if parsed:
+            ops.append(UpdateOne({"_id": chat_id}, {"$max": parsed}, upsert=True))
+        chat_ids.append(chat_id)
+
+    if ops:
+        last_clicked_col.bulk_write(ops, ordered=False)
+
+    return chat_ids
+
+
+def _record_login_blocking(email: str, mac_id: str, ts: datetime):
+    logged_in_col.update_one({"_id": email}, {"$set": {"logged_in_at": ts, "mac_id": mac_id}}, upsert=True)
+
+
+def _get_registered_mac_blocking(email: str) -> Optional[str]:
+    doc = logged_in_col.find_one({"_id": email})
+    return doc.get("mac_id") if doc else None
+
+
+def _load_all_presence_blocking() -> Dict[str, dict]:
+    result = {}
+    for doc in last_seen_col.find({}):
+        last_seen_at = doc.get("last_seen_at")
+        result[doc["_id"]] = {
+            "is_online": False,
+            "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+            "user_is_on": None,
+        }
+    return result
+
+
+def _load_missing_presence_blocking(emails: List[str]) -> Dict[str, dict]:
+    result = {}
+    for doc in last_seen_col.find({"_id": {"$in": emails}}):
+        last_seen_at = doc.get("last_seen_at")
+        result[doc["_id"]] = {
+            "is_online": doc.get("is_online", False),
+            "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+            "user_is_on": None,
+        }
+    return result
+
+
+def _build_friend_watchers_and_lists_blocking():
+    watchers: Dict[str, Set[str]] = {}
+    lists: Dict[str, Set[str]] = {}
+    for doc in all_type_list_col.find({}, {"friend_list": 1}):
+        user_email = doc["_id"]
+        friends = set(doc.get("friend_list", []))
+        lists[user_email] = friends
+        for friend_email in friends:
+            watchers.setdefault(friend_email, set()).add(user_email)
+
+    return watchers, lists
+
+
+def _get_friend_list_blocking(user_email: str) -> List[str]:
+    doc = all_type_list_col.find_one({"_id": user_email}, {"friend_list": 1})
+    return (doc or {}).get("friend_list", [])
+
+
+def _build_unread_counts_blocking(user_email: str, friend_list: List[str]) -> Dict[str, int]:
+    me_field = sanitize_email(user_email)
+    chat_ids = {f: get_chat_id(user_email, f) for f in friend_list}
+
+    clicked = {}
+    if chat_ids:
+        for d in last_clicked_col.find({"_id": {"$in": list(chat_ids.values())}}, {me_field: 1}):
+            clicked[d["_id"]] = d.get(me_field)
+
+    out: Dict[str, int] = {}
+    for friend, cid in chat_ids.items():
+        q = {
+            "sent_by": friend,
+            "sent_to": user_email,
+            "delete_from_all": {"$ne": True},
+            _dfm_path(user_email): {"$ne": True},
+        }
+        ts = clicked.get(cid)
+        if ts:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            q["received_at"] = {"$gt": ts.isoformat(timespec="microseconds")}
+        out[friend] = messages_col.count_documents(q, limit=100)
+    return out
+
+
+def _get_status_blocking(me: str, friend: str) -> dict:
+    friend_doc = last_seen_col.find_one({"_id": friend}) or {}
+    chat_id = get_chat_id(me, friend)
+    clicked_doc = last_clicked_col.find_one({"_id": chat_id}) or {}
+    me_field = sanitize_email(me)
+    friend_field = sanitize_email(friend)
+    return {
+        "friend_email": friend,
+        "is_online": friend_doc.get("is_online", False),
+        "user_is_on": friend_doc.get("user_is_on"),
+        "last_seen_at": friend_doc.get("last_seen_at"),
+        "is_on_same_chat_as_me": friend_doc.get("user_is_on") == me,
+        "my_last_clicked": clicked_doc.get(me_field),
+        "friend_last_clicked": clicked_doc.get(friend_field),
+    }
+
+
+# ======================================================================
+# LIVE SERVICE: websocket plumbing
+# ======================================================================
+
+async def safe_send(ws: Optional[WebSocket], payload: dict) -> None:
+    if ws is None:
+        return
+    try:
+        await ws.send_json(payload)
+    except Exception:
+        pass
+
+
+async def send_to_user(email: str, payload: dict, exclude_mac: Optional[str] = None) -> None:
+    socks = [ws for mac, ws in list((connected_users.get(email) or {}).items()) if mac != exclude_mac]
+    if not socks:
+        return
+    await asyncio.gather(*(safe_send(ws, payload) for ws in socks), return_exceptions=True)
+
+
+async def broadcast_presence_to_friends(changed_email: str) -> None:
+    watchers = friend_watchers.get(changed_email)
+    if not watchers:
+        return
+    await asyncio.gather(
+        *(send_to_user(w, {"type": "presence_update", "email": changed_email, **_presence_fields(changed_email, w)})
+          for w in list(watchers) if w in connected_users),
+        return_exceptions=True,
+    )
+
+
+async def notify_peer(peer_email: str, changed_email: str) -> None:
+    await send_to_user(
+        peer_email,
+        {"type": "presence_update", "email": changed_email, **_presence_fields(changed_email, peer_email)},
+    )
+
+
+async def send_seen_receipt(viewer: str, peer: str, ts: datetime) -> None:
+    await send_to_user(peer, {"type": "seen_receipt", "by": viewer, "seen_at": ts.isoformat()})
+
+
+async def leave_chat(email: str) -> None:
+    state = presence_state.get(email, {})
+    prev = state.get("user_is_on")
+    if not prev:
+        return
+    ts = now_utc()
+    state["user_is_on"] = None
+    _remember_click(email, prev, ts)
+    await send_seen_receipt(email, prev, ts)
+    await notify_peer(prev, email)
+
+
+async def enter_chat(email: str, target: str) -> None:
+    state = presence_state.setdefault(email, {"is_online": True, "last_seen_at": None, "user_is_on": None})
+    if state.get("user_is_on") and state["user_is_on"] != target:
+        await leave_chat(email)
+    ts = now_utc()
+    state["user_is_on"] = target
+    _remember_click(email, target, ts)
+    await send_seen_receipt(email, target, ts)
+    await notify_peer(target, email)
+
+
+async def send_bulk_presence(requester_email: str, friend_emails: List[str]) -> None:
+    if not connected_users.get(requester_email) or not friend_emails:
+        return
+
+    missing = [e for e in friend_emails if presence_state.get(e) is None]
+    if missing:
+        fetched = await run_blocking(_load_missing_presence_blocking, missing)
+        for email, state in fetched.items():
+            presence_state[email] = state
+
+    updates = []
+    for email in friend_emails:
+        if presence_state.get(email) is None:
+            continue
+        updates.append({"email": email, **_presence_fields(email, requester_email)})
+
+    print(f"[bulk_presence] -> {requester_email}: {len(updates)} entries ({len(missing)} fetched from mongo)")
+    await send_to_user(requester_email, {"type": "bulk_presence", "updates": updates})
+
+
+async def mark_user_online(email: str) -> None:
+    ts = now_utc()
+    presence_state[email] = {"is_online": True, "last_seen_at": ts.isoformat(), "user_is_on": None}
+    asyncio.create_task(run_blocking(_persist_user_online_blocking, email, ts))
+
+
+async def mark_user_offline(email: str) -> None:
+    ts = now_utc()
+    presence_state[email] = {"is_online": False, "last_seen_at": ts.isoformat(), "user_is_on": None}
+    asyncio.create_task(run_blocking(_persist_user_offline_blocking, email, ts))
+
+
+async def mark_chat_target(email: str, target_email: Optional[str]) -> None:
+    state = presence_state.setdefault(email, {"is_online": True, "last_seen_at": None, "user_is_on": None})
+    state["user_is_on"] = target_email
+    asyncio.create_task(run_blocking(_persist_chat_target_blocking, email, target_email))
+
+
+async def touch_last_clicked(email: str, target_email: str) -> None:
+    ts = now_utc()
+    asyncio.create_task(run_blocking(_persist_last_clicked_blocking, email, target_email, ts))
+
+
+async def handle_event(email: str, data: dict) -> None:
+    event_type = data.get("type")
+
+    if event_type == "opened_chat":
+        target = data.get("target_email")
+        if target:
+            await enter_chat(email, target)
+
+    elif event_type == "closed_chat":
+        await leave_chat(email)
+
+    elif event_type == "sync_request":
+        friend_emails = data.get("friend_list") or []
+        await send_bulk_presence(email, friend_emails)
+        pending = await run_blocking(_pop_pending_notifications_blocking, email)
+        for note in pending:
+            await send_to_user(email, note)
+
+    
+    elif event_type == "sync_last_clicked":
+        entries = data.get("entries") or []
+        if not entries:
+            return
+        synced_chat_ids = await run_blocking(_push_last_clicked_batch_blocking, entries)
+        await send_to_user(email, {"type": "sync_last_clicked_ack", "chat_ids": synced_chat_ids})
+
+
+async def cleanup_user(email: str, mac_id: str, ws: WebSocket) -> None:
+    conns = connected_users.get(email)
+    if not conns or conns.get(mac_id) is not ws:
+        return
+
+    conns.pop(mac_id, None)
+    if conns:
+        return
+    connected_users.pop(email, None)
+
+    await leave_chat(email)
+    await mark_user_offline(email)
+    await run_blocking(_flush_clicks_blocking, email)
+    await broadcast_presence_to_friends(email)
+
+
+# ======================================================================
+# LIVE SERVICE: change-stream watchers (background threads)
+# ======================================================================
+
+def _watch_last_seen_changes():
+    while True:
+        try:
+            print("[last_seen watcher] change stream connected")
+            with last_seen_col.watch(full_document="updateLookup") as stream:
+                for change in stream:
+                    email = change["documentKey"]["_id"]
+                    full_doc = change.get("fullDocument")
+                    if not full_doc:
+                        continue
+
+                    old_state = presence_state.get(email)
+                    last_seen_at = full_doc.get("last_seen_at")
+                    new_state = {
+                        "is_online": full_doc.get("is_online", False),
+                        "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+                        "user_is_on": (old_state or {}).get("user_is_on"),
+                    }
+
+                    if old_state == new_state:
+                        continue
+
+                    print(f"[last_seen CHANGED] {email}: {old_state} -> {new_state}")
+                    presence_state[email] = new_state
+
+                    if MAIN_LOOP is not None:
+                        asyncio.run_coroutine_threadsafe(broadcast_presence_to_friends(email), MAIN_LOOP)
+
+        except Exception as e:
+            print(f"[last_seen watcher] stream error, retrying in 3s: {e}")
+            time.sleep(3)
+
+
+async def _push_released_messages(docs: List[dict]):
+    for doc in docs:
+        if not doc:
+            continue
+        note = {"type": "new_message", "message": _json_safe(doc)}
+        await send_to_user(doc.get("sent_to"), note)
+        await send_to_user(doc.get("sent_by"), note)
+
+
+def _watch_friend_list_changes():
+    while True:
+        try:
+            print("[friend_list watcher] change stream connected")
+            with all_type_list_col.watch(full_document="updateLookup") as stream:
+                for change in stream:
+                    user_email = change["documentKey"]["_id"]
+                    full_doc = change.get("fullDocument")
+                    if not full_doc:
+                        continue
+
+                    new_friends = set(full_doc.get("friend_list", []))
+                    old_friends = user_friend_lists.get(user_email, set())
+                    if new_friends == old_friends:
+                        continue
+
+                    added = new_friends - old_friends
+                    removed = old_friends - new_friends
+                    print(f"[friend_list CHANGED] {user_email}: +{added} -{removed}")
+
+                    user_friend_lists[user_email] = new_friends
+
+                    for friend_email in added:
+                        friend_watchers.setdefault(friend_email, set()).add(user_email)
+                    for friend_email in removed:
+                        watchers = friend_watchers.get(friend_email)
+                        if watchers:
+                            watchers.discard(user_email)
+
+                    if MAIN_LOOP is not None:
+                        for friend_email in added:
+                            asyncio.run_coroutine_threadsafe(
+                                send_to_user(user_email, {"type": "friend_added", "email": friend_email}),
+                                MAIN_LOOP)
+                        if added:
+                            asyncio.run_coroutine_threadsafe(
+                                send_bulk_presence(user_email, list(added)), MAIN_LOOP)
+
+                    for friend_email in added:
+                        if user_email in user_friend_lists.get(friend_email, set()):
+                            try:
+                                released = _release_unfriend_held_blocking(user_email, friend_email)
+                                if released and MAIN_LOOP is not None:
+                                    asyncio.run_coroutine_threadsafe(
+                                        _push_released_messages(released), MAIN_LOOP)
+                            except Exception as e:
+                                print(f"[friend_list watcher] release failed: {e}")
+        except Exception as e:
+            print(f"[friend_list watcher] stream error, retrying in 3s: {e}")
+            time.sleep(3)
+
+
+
+
+async def _push_external_new(doc: dict):
+    note = {"type": "new_message", "message": _json_safe(doc)}
+    to, by = doc.get("sent_to"), doc.get("sent_by")
+    if to:
+        await send_to_user(to, note)
+    if by and by != to:
+        await send_to_user(by, note)
+
+
+async def _push_external_update(doc: dict, notes: List[dict], extra_users: Optional[List[str]] = None):
+    if extra_users is None:
+        users = {doc.get("sent_to"), doc.get("sent_by")}
+    else:
+        users = set(extra_users)
+    for u in [x for x in users if x]:
+        for n in notes:
+            await send_to_user(u, n)
+
+
+def _watch_messages_changes():
+    pipeline = [{"$match": {"operationType": {"$in": ["insert", "update"]}}}]
+    while True:
+        try:
+            print("[messages watcher] change stream connected")
+            with messages_col.watch(pipeline, full_document="updateLookup") as stream:
+                for change in stream:
+                    if MAIN_LOOP is None:
+                        continue
+
+                    op = change["operationType"]
+                    msg_id = change["documentKey"]["_id"]
+                    doc = change.get("fullDocument")
+                    if not doc:
+                        continue
+
+                    def run(coro):
+                        asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
+
+                    if op == "insert":
+                        if not doc.get("received_at"):
+                            stamp = now_utc().isoformat(timespec="microseconds")
+                            messages_col.update_one(
+                                {"_id": msg_id, "received_at": {"$in": [None]}},
+                                {"$set": {"received_at": stamp}},
+                            )
+                            doc["received_at"] = stamp
+                        if _was_api_pushed("new", msg_id):
+                            continue
+                        print(f"[messages watcher] external insert {msg_id}")
+                        run(_push_external_new(doc))
+                        continue
+
+                    updated = (change.get("updateDescription") or {}).get("updatedFields") or {}
+
+                    if updated.get("delete_from_all") is True:
+                        if not _was_api_pushed("del_all", msg_id):
+                            run(_push_external_update(doc, [{"type": "message_deleted_all", "_id": msg_id}]))
+                        continue
+
+                    if "msg_content" in updated or "is_edited" in updated:
+                        if not _was_api_pushed("edit", msg_id):
+                            run(_push_external_update(
+                                doc,
+                                [{"type": "message_edited", "_id": msg_id, "msg_content": doc.get("msg_content")}],
+                            ))
+
+                    if any(k.startswith("delete_from_me") for k in updated):
+                        flags = doc.get("delete_from_me") or {}
+                        whole = "delete_from_me" in updated
+                        whos = []
+                        for w in {doc.get("sent_by"), doc.get("sent_to")}:
+                            if not w:
+                                continue
+                            if not (whole or _dfm_path(w) in updated):
+                                continue
+                            if flags.get(sanitize_email(w)) is True \
+                                    and not _was_api_pushed("del_me", f"{msg_id}:{w}"):
+                                whos.append(w)
+
+                        if whos:
+                            run(_push_external_update(
+                                doc,
+                                [{"type": "message_deleted_me", "_id": msg_id}],
+                                extra_users=whos,
+                            ))
+        except Exception as e:
+            print(f"[messages watcher] stream error, retrying in 3s: {e}")
+            time.sleep(3)
+
+
+def _migrate_delete_from_me_blocking():
+    ops, total = [], 0
+    cursor = messages_col.find(
+        {"delete_from_me": {"$not": {"$type": "object"}}},
+        {"sent_by": 1, "sent_to": 1, "deleted_for": 1},
+    )
+    for d in cursor:
+        if not d.get("sent_by") or not d.get("sent_to"):
+            continue
+        gone = set(d.get("deleted_for") or [])
+        dfm = {
+            sanitize_email(d["sent_by"]): d["sent_by"] in gone,
+            sanitize_email(d["sent_to"]): d["sent_to"] in gone,
+        }
+        ops.append(UpdateOne({"_id": d["_id"]}, {"$set": {"delete_from_me": dfm}, "$unset": {"deleted_for": ""}}))
+        if len(ops) >= 500:
+            messages_col.bulk_write(ops, ordered=False)
+            total += len(ops)
+            ops = []
+    if ops:
+        messages_col.bulk_write(ops, ordered=False)
+        total += len(ops)
+    print(f"[migrate] delete_from_me converted on {total} messages")
+
+
+@app.on_event("startup")
+async def startup_event():
+    global MAIN_LOOP, presence_state, friend_watchers, user_friend_lists
+
+    MAIN_LOOP = asyncio.get_event_loop()
+
+    await run_blocking(_strip_legacy_presence_fields_blocking)
+    await run_blocking(_create_friend_list_index_blocking)
+    await run_blocking(_migrate_delete_from_me_blocking)
+
+    presence_state = await run_blocking(_load_all_presence_blocking)
+    friend_watchers, user_friend_lists = await run_blocking(_build_friend_watchers_and_lists_blocking)
+
+    threading.Thread(target=_watch_last_seen_changes, daemon=True, name="last_seen-watcher").start()
+    threading.Thread(target=_watch_friend_list_changes, daemon=True, name="friend_list-watcher").start()
+    threading.Thread(target=_watch_messages_changes, daemon=True, name="messages-watcher").start()
+
+    print(f"[startup] warmed presence_state({len(presence_state)}) "
+          f"friend_watchers({len(friend_watchers)}) user_friend_lists({len(user_friend_lists)})")
+
+
+# ======================================================================
+# LIVE SERVICE: HTTP endpoints
+# ======================================================================
+
+@app.post("/refresh_friend_graph")
+async def refresh_friend_graph():
+    global friend_watchers, user_friend_lists
+    friend_watchers, user_friend_lists = await run_blocking(_build_friend_watchers_and_lists_blocking)
+    return {"ok": True, "tracked_emails": len(friend_watchers)}
+
+
+@app.post("/push_scheduled_message")
+async def push_scheduled_message(request: Request):
+    try:
+        payload = await request.json()
+
+        def do_write():
+            op = payload.get("operation")
+            _id = payload.get("_id")
+            if not _id:
+                raise ValueError("missing _id")
+
+            existing = messages_to_send_col.find_one({"_id": _id}, {"sent": 1})
+            if existing and existing.get("sent") is True:
+                return True
+
+            if op == "delete":
+                messages_to_send_col.delete_one({"_id": _id})
+                return True
+
+            scheduled_at = _norm_iso_utc(payload.get("scheduled_at"))
+            if not scheduled_at:
+                raise ValueError("invalid scheduled_at")
+
+            now_iso = now_utc().isoformat(timespec="microseconds")
+            synced_at = _norm_iso_utc(payload.get("client_synced_at")) or now_iso
+            created_at = _norm_iso_utc(payload.get("created_at"))
+
+            set_doc = {
+                "scheduled_at": scheduled_at,
+                "from": payload.get("from"),
+                "to": payload.get("to"),
+                "message_type": payload.get("message_type"),
+                "message_content": payload.get("message_content"),
+                "cloud_public_id": payload.get("cloud_public_id"),
+                "last_synced_at": synced_at,
+            }
+            if created_at:
+                set_doc["created_at"] = created_at
+            if op == "expire":
+                set_doc["expired_at"] = synced_at
+
+            set_on_insert = {
+                "sent": False,
+                "sent_at": None,
+                "server_received_at": now_iso,
+                "synced_late": _parse_iso_utc(synced_at) > _parse_iso_utc(scheduled_at),
+            }
+            if not created_at:
+                set_on_insert["created_at"] = synced_at
+
+            messages_to_send_col.update_one(
+                {"_id": _id},
+                {"$set": set_doc, "$setOnInsert": set_on_insert},
+                upsert=True,
+            )
+            return True
+
+        ok = await run_blocking(do_write)
+        return {"ok": ok}
+    except Exception as e:
+        print(f"[push_scheduled_message] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+class MessagePayload(BaseModel):
+    id: str = Field(..., alias="_id")
+    msg_type: str
+    msg_content: str
+    is_edited: bool = False
+    sent_by: str
+    sent_to: str
+    sent_at: str
+    received_at: Optional[str] = None
+    delete_from_me: Optional[Any] = None
+    delete_from_all: bool = False
+    thumbnail_url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    origin_mac: Optional[str] = None
+
+    class Config:
+        allow_population_by_field_name = True
+
+
+@app.post("/send_message")
+async def send_message(payload: MessagePayload):
+    try:
+        msg = payload.dict(by_alias=True)
+        origin_mac = msg.pop("origin_mac", None)
+        _mark_api_push("new", msg["_id"])
+
+        raw_dfm = msg.get("delete_from_me")
+        sender_deleted = (
+            bool(raw_dfm.get(sanitize_email(msg["sent_by"]))) if isinstance(raw_dfm, dict) else bool(raw_dfm)
+        )
+        if sender_deleted:
+            _mark_api_push("del_me", f'{msg["_id"]}:{msg["sent_by"]}')
+
+        received_at, held_reason = await run_blocking(_save_message_blocking, msg)
+        msg["received_at"] = received_at
+        msg["held_reason"] = held_reason
+        dfm = _default_dfm(msg["sent_by"], msg["sent_to"])
+        if sender_deleted:
+            dfm[sanitize_email(msg["sent_by"])] = True
+        if held_reason:
+            dfm[sanitize_email(msg["sent_to"])] = True
+        msg["delete_from_me"] = dfm
+
+        note = {"type": "new_message", "message": msg}
+        if not held_reason:
+            await send_to_user(msg["sent_to"], note)
+        if msg["sent_by"] != msg["sent_to"]:
+            await send_to_user(msg["sent_by"], note, exclude_mac=origin_mac)
+        return {"ok": True, "received_at": received_at, "held_reason": held_reason}
+    except Exception:
+        import traceback
+        print("[send_message] ERROR:\n" + traceback.format_exc())
+        raise
+
+
+@app.get("/get_messages_page")
+async def get_messages_page(user_a: str, user_b: str, before_sent_at: Optional[str] = None, limit: int = 20):
+    docs = await run_blocking(_get_messages_page_blocking, user_a, user_b, before_sent_at, limit)
+    return {"ok": True, "messages": docs, "has_more": len(docs) == limit}
+
+
+@app.post("/mark_delete_for_all/{msg_id}")
+async def mark_delete_for_all(msg_id: str, request: Request):
+    body = await request.json()
+
+    _mark_api_push("del_all", msg_id)
+
+    held = await run_blocking(_get_held_reason_blocking, msg_id)
+    await run_blocking(_mark_deleted_for_all_blocking, msg_id)
+    note = {"type": "message_deleted_all", "_id": msg_id}
+
+    peer = body.get("notify_email")
+    if peer and not held:
+        await send_to_user(peer, note)
+    who = body.get("who")
+    if who:
+        await send_to_user(who, note, exclude_mac=body.get("origin_mac"))
+    return {"ok": True}
+
+
+@app.post("/mark_delete_for_me/{msg_id}")
+async def mark_delete_for_me(msg_id: str, request: Request):
+    body = await request.json()
+    who = body.get("who")
+
+    _mark_api_push("del_me", f"{msg_id}:{who}")
+
+    await run_blocking(_mark_deleted_for_me_blocking, msg_id, who)
+    if who:
+        await send_to_user(who, {"type": "message_deleted_me", "_id": msg_id}, exclude_mac=body.get("origin_mac"))
+    return {"ok": True}
+
+
+@app.post("/edit_message/{msg_id}")
+async def edit_message(msg_id: str, request: Request):
+    body = await request.json()
+
+    _mark_api_push("edit", msg_id)
+
+    held = await run_blocking(_get_held_reason_blocking, msg_id)
+    await run_blocking(_edit_message_blocking, msg_id, body.get("msg_content"))
+    note = {"type": "message_edited", "_id": msg_id, "msg_content": body.get("msg_content")}
+
+    peer = body.get("notify_email")
+    if peer and not held:
+        await send_to_user(peer, note)
+    who = body.get("who")
+    if who:
+        await send_to_user(who, note, exclude_mac=body.get("origin_mac"))
+    return {"ok": True}
+
+
+@app.post("/unfriend_user")
+async def unfriend_user(request: Request):
+    try:
+        body = await request.json()
+        user = body.get("user")
+        friend = body.get("friend")
+        if not user or not friend or user == friend:
+            return {"ok": False, "error": "invalid users"}
+        await run_blocking(_unfriend_user_blocking, user, friend)
+        return {"ok": True}
+    except Exception as e:
+        print(f"[unfriend_user] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/clear_chat")
+async def clear_chat(request: Request):
+    try:
+        body = await request.json()
+        user = body.get("user")
+        friend = body.get("friend")
+        if not user or not friend:
+            return {"ok": False, "error": "invalid users"}
+        n = await run_blocking(_clear_chat_blocking, user, friend, body.get("before"))
+        return {"ok": True, "cleared": n}
+    except Exception as e:
+        print(f"[clear_chat] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/upload_chat_image")
+async def upload_chat_image(msg_id: str = Form(...), file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+
+        def do_upload():
+            full = cloudinary.uploader.upload(
+                contents, public_id=f"{msg_id}_full", folder="chat_images",
+                overwrite=True, resource_type="image",
+            )
+            thumb = cloudinary.uploader.upload(
+                contents, public_id=f"{msg_id}_thumb", folder="chat_images",
+                overwrite=True, resource_type="image",
+                transformation=[{"width": 1200, "quality": "auto:good", "crop": "limit"}],
+            )
+            return full, thumb
+
+        full, thumb = await run_blocking(do_upload)
+        return {"ok": True, "url": full.get("secure_url"), "thumbnail_url": thumb.get("secure_url")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.websocket("/ws/{email}/{mac_id}")
+async def websocket_endpoint(websocket: WebSocket, email: str, mac_id: str):
+    await websocket.accept()
+
+    conns = connected_users.setdefault(email, {})
+    was_empty = not conns
+    old = conns.get(mac_id)
+    conns[mac_id] = websocket
+    if old is not None and old is not websocket:
+        try:
+            await old.close()
+        except Exception:
+            pass
+
+    if was_empty:
+        await mark_user_online(email)
+    asyncio.create_task(run_blocking(_record_login_blocking, email, mac_id, now_utc()))
+    if was_empty:
+        await broadcast_presence_to_friends(email)
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=HEARTBEAT_IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_json({"type": "ping"})
+                    reply = await asyncio.wait_for(websocket.receive_json(), timeout=HEARTBEAT_PING_TIMEOUT)
+                except Exception:
+                    break
+                if reply.get("type") != "pong":
+                    await handle_event(email, reply)
+                continue
+
+            if data.get("type") == "pong":
+                continue
+
+            await handle_event(email, data)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        await cleanup_user(email, mac_id, websocket)
+
+
+@app.get("/friends_last_seen")
+async def friends_last_seen(emails: str):
+    email_list = [e for e in emails.split(",") if e]
+    if not email_list:
+        return {}
+
+    result = {}
+    missing = []
+    for email in email_list:
+        state = presence_state.get(email)
+        if state is None:
+            missing.append(email)
+        else:
+            result[email] = {"is_online": state.get("is_online", False), "last_seen_at": state.get("last_seen_at")}
+
+    if missing:
+        fetched = await run_blocking(_load_missing_presence_blocking, missing)
+        for email, state in fetched.items():
+            presence_state[email] = state
+            result[email] = {"is_online": state.get("is_online", False), "last_seen_at": state.get("last_seen_at")}
+
+    return result
+
+
+@app.get("/status")
+async def get_status(me: str, friend: str):
+    out = await run_blocking(_get_status_blocking, me, friend)
+
+    mem = last_clicked_mem.get(get_chat_id(me, friend), {}).get(sanitize_email(friend))
+    if mem:
+        out["friend_last_clicked"] = mem.isoformat()
+
+    s = presence_state.get(friend, {})
+    out["is_online"] = s.get("is_online", out.get("is_online", False))
+    out["last_seen_at"] = s.get("last_seen_at", out.get("last_seen_at"))
+    out["is_on_same_chat_as_me"] = bool(s.get("is_online") and s.get("user_is_on") == me)
+    out.pop("user_is_on", None)
+
+    for k in ("last_seen_at", "my_last_clicked", "friend_last_clicked"):
+        v = out.get(k)
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+
+    return out
+
+
+@app.get("/check_mac/{email}")
+async def check_mac(email: str, mac_id: str):
+    registered = await run_blocking(_get_registered_mac_blocking, email)
+    return {"match": registered == mac_id, "registered_mac": registered}
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "tracked_users": len(presence_state),
+        "connected": sum(len(v) for v in connected_users.values()),
+        "tracked_friend_graph_entries": len(friend_watchers),
+    }
+
+
+@app.get("/get_scheduled_messages")
+async def get_scheduled_messages(from_user: str, after: Optional[str] = None):
+    try:
+        after_ = _norm_iso_utc(after) or now_utc().isoformat(timespec="microseconds")
+
+        def do_read():
+            docs = list(messages_to_send_col.find(
+                {"from": from_user, "sent": {"$ne": True}, "scheduled_at": {"$gt": after_}}
+            ))
+            for d in docs:
+                d["_id"] = str(d["_id"])
+            return docs
+
+        docs = await run_blocking(do_read)
+        return {"ok": True, "messages": docs}
+    except Exception as e:
+        print(f"[get_scheduled_messages] error: {e}")
+        return {"ok": False, "error": str(e), "messages": []}
+
+
+@app.post("/upload_scheduled_image")
+async def upload_scheduled_image(widget_id: str = Form(...), file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        result = cloudinary.uploader.upload(
+            contents, public_id=widget_id, folder="scheduled_msgs",
+            overwrite=True, resource_type="image",
+        )
+        return {"ok": True, "public_id": result.get("public_id"), "url": result.get("secure_url")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class DeleteImageRequest(BaseModel):
+    public_id: str
+
+
+@app.post("/delete_scheduled_image")
+async def delete_scheduled_image(req: DeleteImageRequest):
+    try:
+        result = cloudinary.uploader.destroy(req.public_id, resource_type="image")
+        return {"ok": True, "result": result.get("result")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _get_last_visible_message_blocking(user_a: str, user_b: str, viewer: str) -> Optional[dict]:
+    match = {
+        "$or": [{"sent_by": user_a, "sent_to": user_b}, {"sent_by": user_b, "sent_to": user_a}],
+        _dfm_path(viewer): {"$ne": True},
+    }
+    pipeline = [
+        {"$match": match},
+        {"$addFields": {"_eff": _eff_expr(viewer)}},
+        {"$sort": {"_eff": -1}},
+        {"$limit": 1},
+    ]
+    docs = list(messages_col.aggregate(pipeline, allowDiskUse=True))
+    return docs[0] if docs else None
+
+
+def _build_last_messages_preview_blocking(user_email: str) -> Dict[str, Optional[dict]]:
+    friend_doc = all_type_list_col.find_one({"_id": user_email})
+    friend_list = friend_doc.get("friend_list", []) if friend_doc else []
+
+    result: Dict[str, Optional[dict]] = {}
+    for friend_email in friend_list:
+        msg = _get_last_visible_message_blocking(user_email, friend_email, user_email)
+        if msg is None:
+            result[friend_email] = None
+            continue
+
+        is_deleted_all = bool(msg.get("delete_from_all", False))
+        entry = {
+            "_id": msg.get("_id"),
+            "sent_by": msg.get("sent_by"),
+            "sent_to": msg.get("sent_to"),
+            "sent_at": msg.get("sent_at"),
+            "received_at": msg.get("received_at"),
+            "delete_from_all": is_deleted_all,
+        }
+
+        if is_deleted_all:
+            entry["msg_type"] = "delete_from_everyone"
+            entry["msg_content"] = None
+        else:
+            msg_type = msg.get("msg_type")
+            entry["msg_type"] = msg_type
+            if msg_type == "text":
+                entry["msg_content"] = (msg.get("msg_content") or "")[:300]
+            else:
+                entry["msg_content"] = None
+
+        result[friend_email] = entry
+
+    return result
+
+
+@app.get("/last_messages_preview")
+async def last_messages_preview(user_email: str):
+    try:
+        data = await run_blocking(_build_last_messages_preview_blocking, user_email)
+        friends = await run_blocking(_get_friend_list_blocking, user_email)
+        unread = await run_blocking(_build_unread_counts_blocking, user_email, friends)
+        return {"ok": True, "friend_list_last_messages": data, "unread_counts": unread}
+    except Exception as e:
+        print(f"[last_messages_preview] error: {e}")
+        return {"ok": False, "error": str(e), "friend_list_last_messages": {}, "unread_counts": {}}
+
+
+def _sync_incoming_blocking(user_email: str, since, limit: int = 200):
+    if not since:
+        return [], False
+    q = {
+        "$or": [{"sent_to": user_email}, {"sent_by": user_email}],
+        "received_at": {"$gt": since},
+        _dfm_path(user_email): {"$ne": True},
+    }
+    docs = list(messages_col.find(q).sort("received_at", 1).limit(limit + 1))
+    return docs[:limit], len(docs) > limit
+
+
+@app.get("/sync_incoming")
+async def sync_incoming(user_email: str, since: Optional[str] = None, limit: int = 200):
+    docs, has_more = await run_blocking(_sync_incoming_blocking, user_email, since, limit)
+    return {"ok": True, "messages": docs, "has_more": has_more}
+
+
+@app.api_route("/process_scheduled_messages", methods=["GET", "POST", "HEAD"])
+async def process_scheduled_messages(limit: int = 200):
+    try:
+        result = await run_blocking(_process_scheduled_messages_blocking, limit)
+        return {"ok": True, **result}
+    except Exception as e:
+        print(f"[process_scheduled_messages] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+
+def _accept_friend_request_blocking(me: str, sender: str) -> dict:
+    if me == sender:
+        raise ValueError("You cannot accept your own request.")
+
+    if not user_table.find_one({"_id": me}) or not user_table.find_one({"_id": sender}):
+        raise ValueError("User not found.")
+
+    me_lists = all_type_list_col.find_one({"_id": me})
+    sender_lists = all_type_list_col.find_one({"_id": sender})
+    if me_lists is None or sender_lists is None:
+        raise ValueError("User relationship data not found.")
+
+    # idempotent: already friends (e.g. a retry after a lost response)
+    if sender in me_lists.get("friend_list", []):
+        return {"already_friends": True}
+
+    # the request must still exist on my side
+    if sender not in me_lists.get("incoming_list", []):
+        raise ValueError("This friend request no longer exists.")
+
+    if sender in me_lists.get("blocked_list", []) or me in sender_lists.get("blocked_list", []):
+        all_type_list_col.update_one({"_id": me}, {"$pull": {"incoming_list": sender}})
+        all_type_list_col.update_one({"_id": sender}, {"$pull": {"outgoing_list": me}})
+        raise ValueError("This request cannot be accepted because one of you has blocked the other.")
+
+    # atomic-enough two-sided write: both lists updated together
+    all_type_list_col.update_one(
+        {"_id": me},
+        {"$addToSet": {"friend_list": sender}, "$pull": {"incoming_list": sender}},
+    )
+    all_type_list_col.update_one(
+        {"_id": sender},
+        {"$addToSet": {"friend_list": me}, "$pull": {"outgoing_list": me}},
+    )
+
+    # store a notification so the sender learns about it even if offline right now
+    pending_notifications_col.insert_one({
+        "to_user": sender,
+        "type": "request_accepted",
+        "by": me,
+        "created_at": now_utc(),
+    })
+    return {"already_friends": False}
+
+
+def _reject_friend_request_blocking(me: str, sender: str) -> dict:
+    if me == sender:
+        raise ValueError("invalid users")
+
+    me_lists = all_type_list_col.find_one({"_id": me})
+    sender_lists = all_type_list_col.find_one({"_id": sender})
+    if me_lists is None or sender_lists is None:
+        raise ValueError("User relationship data not found.")
+
+    # idempotent: if it's already gone, that's the desired end state
+    all_type_list_col.update_one({"_id": me}, {"$pull": {"incoming_list": sender}})
+    all_type_list_col.update_one({"_id": sender}, {"$pull": {"outgoing_list": me}})
+    return {"rejected": True}
+
+
+@app.post("/accept_friend_request")
+async def accept_friend_request(request: Request):
+    try:
+        body = await request.json()
+        me = body.get("me")
+        sender = body.get("sender")
+        if not me or not sender:
+            return {"ok": False, "error": "invalid users"}
+
+        result = await run_blocking(_accept_friend_request_blocking, me, sender)
+
+        # push to whichever side is online right now; the change-stream watcher
+        # also pushes friend_list updates, so this is just the fastest path
+        if MAIN_LOOP is not None:
+            await send_to_user(me, {"type": "friend_added", "email": sender})
+            await send_to_user(sender, {"type": "friend_added", "email": me})
+            await send_to_user(sender, {"type": "request_accepted", "by": me})
+
+        return {"ok": True, **result}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        print(f"[accept_friend_request] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/reject_friend_request")
+async def reject_friend_request(request: Request):
+    try:
+        body = await request.json()
+        me = body.get("me")
+        sender = body.get("sender")
+        if not me or not sender:
+            return {"ok": False, "error": "invalid users"}
+
+        result = await run_blocking(_reject_friend_request_blocking, me, sender)
+
+        await send_to_user(sender, {"type": "request_rejected", "by": me})
+        return {"ok": True, **result}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        print(f"[reject_friend_request] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def _pop_pending_notifications_blocking(user_email: str) -> List[dict]:
+    docs = list(pending_notifications_col.find({"to_user": user_email}).sort("created_at", 1))
+    if docs:
+        pending_notifications_col.delete_many({"_id": {"$in": [d["_id"] for d in docs]}})
+    out = []
+    for d in docs:
+        out.append({"type": d["type"], "by": d.get("by"),
+                    "created_at": _iso_or_none(d.get("created_at"))})
+    return out
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
