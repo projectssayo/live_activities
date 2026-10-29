@@ -128,6 +128,9 @@ scheduled_msg_db = client["scheduled_messages"]
 messages_to_send_col = scheduled_msg_db["messages_to_send"]
 
 
+pending_notifications_col = live_activities["pending_notifications"]
+pending_notifications_col.create_index([("to_user", 1), ("created_at", 1)])
+
 # ======================================================================
 # APP + GLOBAL STATE
 # ======================================================================
@@ -1852,7 +1855,11 @@ async def handle_event(email: str, data: dict) -> None:
     elif event_type == "sync_request":
         friend_emails = data.get("friend_list") or []
         await send_bulk_presence(email, friend_emails)
+        pending = await run_blocking(_pop_pending_notifications_blocking, email)
+        for note in pending:
+            await send_to_user(email, note)
 
+    
     elif event_type == "sync_last_clicked":
         entries = data.get("entries") or []
         if not entries:
@@ -1936,7 +1943,6 @@ def _watch_friend_list_changes():
 
                     new_friends = set(full_doc.get("friend_list", []))
                     old_friends = user_friend_lists.get(user_email, set())
-
                     if new_friends == old_friends:
                         continue
 
@@ -1953,21 +1959,29 @@ def _watch_friend_list_changes():
                         if watchers:
                             watchers.discard(user_email)
 
+                    if MAIN_LOOP is not None:
+                        for friend_email in added:
+                            asyncio.run_coroutine_threadsafe(
+                                send_to_user(user_email, {"type": "friend_added", "email": friend_email}),
+                                MAIN_LOOP)
+                        if added:
+                            asyncio.run_coroutine_threadsafe(
+                                send_bulk_presence(user_email, list(added)), MAIN_LOOP)
+
                     for friend_email in added:
                         if user_email in user_friend_lists.get(friend_email, set()):
                             try:
                                 released = _release_unfriend_held_blocking(user_email, friend_email)
                                 if released and MAIN_LOOP is not None:
-                                    print(f"[friend_list watcher] released {len(released)} held message(s) between {user_email} and {friend_email}")
-                                    asyncio.run_coroutine_threadsafe(_push_released_messages(released), MAIN_LOOP)
+                                    asyncio.run_coroutine_threadsafe(
+                                        _push_released_messages(released), MAIN_LOOP)
                             except Exception as e:
                                 print(f"[friend_list watcher] release failed: {e}")
-
-                    if added and MAIN_LOOP is not None:
-                        asyncio.run_coroutine_threadsafe(send_bulk_presence(user_email, list(added)), MAIN_LOOP)
         except Exception as e:
             print(f"[friend_list watcher] stream error, retrying in 3s: {e}")
             time.sleep(3)
+
+
 
 
 async def _push_external_new(doc: dict):
@@ -2591,6 +2605,125 @@ async def process_scheduled_messages(limit: int = 200):
     except Exception as e:
         print(f"[process_scheduled_messages] error: {e}")
         return {"ok": False, "error": str(e)}
+
+
+
+def _accept_friend_request_blocking(me: str, sender: str) -> dict:
+    if me == sender:
+        raise ValueError("You cannot accept your own request.")
+
+    if not user_table.find_one({"_id": me}) or not user_table.find_one({"_id": sender}):
+        raise ValueError("User not found.")
+
+    me_lists = all_type_list_col.find_one({"_id": me})
+    sender_lists = all_type_list_col.find_one({"_id": sender})
+    if me_lists is None or sender_lists is None:
+        raise ValueError("User relationship data not found.")
+
+    # idempotent: already friends (e.g. a retry after a lost response)
+    if sender in me_lists.get("friend_list", []):
+        return {"already_friends": True}
+
+    # the request must still exist on my side
+    if sender not in me_lists.get("incoming_list", []):
+        raise ValueError("This friend request no longer exists.")
+
+    if sender in me_lists.get("blocked_list", []) or me in sender_lists.get("blocked_list", []):
+        all_type_list_col.update_one({"_id": me}, {"$pull": {"incoming_list": sender}})
+        all_type_list_col.update_one({"_id": sender}, {"$pull": {"outgoing_list": me}})
+        raise ValueError("This request cannot be accepted because one of you has blocked the other.")
+
+    # atomic-enough two-sided write: both lists updated together
+    all_type_list_col.update_one(
+        {"_id": me},
+        {"$addToSet": {"friend_list": sender}, "$pull": {"incoming_list": sender}},
+    )
+    all_type_list_col.update_one(
+        {"_id": sender},
+        {"$addToSet": {"friend_list": me}, "$pull": {"outgoing_list": me}},
+    )
+
+    # store a notification so the sender learns about it even if offline right now
+    pending_notifications_col.insert_one({
+        "to_user": sender,
+        "type": "request_accepted",
+        "by": me,
+        "created_at": now_utc(),
+    })
+    return {"already_friends": False}
+
+
+def _reject_friend_request_blocking(me: str, sender: str) -> dict:
+    if me == sender:
+        raise ValueError("invalid users")
+
+    me_lists = all_type_list_col.find_one({"_id": me})
+    sender_lists = all_type_list_col.find_one({"_id": sender})
+    if me_lists is None or sender_lists is None:
+        raise ValueError("User relationship data not found.")
+
+    # idempotent: if it's already gone, that's the desired end state
+    all_type_list_col.update_one({"_id": me}, {"$pull": {"incoming_list": sender}})
+    all_type_list_col.update_one({"_id": sender}, {"$pull": {"outgoing_list": me}})
+    return {"rejected": True}
+
+
+@app.post("/accept_friend_request")
+async def accept_friend_request(request: Request):
+    try:
+        body = await request.json()
+        me = body.get("me")
+        sender = body.get("sender")
+        if not me or not sender:
+            return {"ok": False, "error": "invalid users"}
+
+        result = await run_blocking(_accept_friend_request_blocking, me, sender)
+
+        # push to whichever side is online right now; the change-stream watcher
+        # also pushes friend_list updates, so this is just the fastest path
+        if MAIN_LOOP is not None:
+            await send_to_user(me, {"type": "friend_added", "email": sender})
+            await send_to_user(sender, {"type": "friend_added", "email": me})
+            await send_to_user(sender, {"type": "request_accepted", "by": me})
+
+        return {"ok": True, **result}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        print(f"[accept_friend_request] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/reject_friend_request")
+async def reject_friend_request(request: Request):
+    try:
+        body = await request.json()
+        me = body.get("me")
+        sender = body.get("sender")
+        if not me or not sender:
+            return {"ok": False, "error": "invalid users"}
+
+        result = await run_blocking(_reject_friend_request_blocking, me, sender)
+
+        await send_to_user(sender, {"type": "request_rejected", "by": me})
+        return {"ok": True, **result}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        print(f"[reject_friend_request] error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def _pop_pending_notifications_blocking(user_email: str) -> List[dict]:
+    docs = list(pending_notifications_col.find({"to_user": user_email}).sort("created_at", 1))
+    if docs:
+        pending_notifications_col.delete_many({"_id": {"$in": [d["_id"] for d in docs]}})
+    out = []
+    for d in docs:
+        out.append({"type": d["type"], "by": d.get("by"),
+                    "created_at": _iso_or_none(d.get("created_at"))})
+    return out
+
 
 
 if __name__ == "__main__":
