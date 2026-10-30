@@ -784,46 +784,67 @@ def search_user_for_send_request(current_user: str, to: str, mac_id: str, ip: st
         return {"success": False, "msg": f"Error: {e}", "data": {}}
 
 
+
+
+
 @app.post("/send_friend_request")
-def send_friend_request(from_user: str, to_: str, mac_id: str, ip: str):
+async def send_friend_request(request: Request):
     try:
+        data = await _read_request_params(request)
+        from_user = data.get("from_user")
+        to_ = data.get("to_") or data.get("to_user")
+
+        if not from_user or not to_:
+            return {"server": True, "success": False, "ok": False, "msg": "invalid users"}
+
         if from_user == to_:
-            return {"server": True, "success": False, "msg": "You cannot send a friend request to yourself."}
+            return {"server": True, "success": False, "ok": False,
+                    "msg": "You cannot send a friend request to yourself."}
 
-        from_user_data = user_table.find_one({"_id": from_user})
-        to_user_data = user_table.find_one({"_id": to_})
+        def do_send():
+            from_user_data = user_table.find_one({"_id": from_user})
+            to_user_data = user_table.find_one({"_id": to_})
+            if from_user_data is None or to_user_data is None:
+                return False, "User not found."
 
-        if from_user_data is None or to_user_data is None:
-            return {"server": True, "success": False, "msg": "User not found."}
+            from_lists = all_type_list_table.find_one({"_id": from_user})
+            to_lists = all_type_list_table.find_one({"_id": to_})
+            if from_lists is None or to_lists is None:
+                return False, "User relationship data not found."
 
-        from_lists = all_type_list_table.find_one({"_id": from_user})
-        to_lists = all_type_list_table.find_one({"_id": to_})
+            if to_ in from_lists.get("blocked_list", []):
+                return False, "You have blocked this user."
+            if from_user in to_lists.get("blocked_list", []):
+                return False, "You are blocked by this user."
+            if to_ in from_lists.get("friend_list", []):
+                return False, "This user is already your friend."
+            if to_ in from_lists.get("outgoing_list", []):
+                return False, "Friend request already sent."
+            if to_ in from_lists.get("incoming_list", []) or from_user in to_lists.get("outgoing_list", []):
+                return False, "This user has already sent you a friend request."
 
-        if from_lists is None or to_lists is None:
-            return {"server": True, "success": False, "msg": "User relationship data not found."}
+            all_type_list_table.update_one({"_id": from_user}, {"$addToSet": {"outgoing_list": to_}})
+            all_type_list_table.update_one({"_id": to_}, {"$addToSet": {"incoming_list": from_user}})
+            return True, "Friend request sent successfully."
 
-        if to_ in from_lists.get("blocked_list", []):
-            return {"server": True, "success": False, "msg": "You have blocked this user."}
+        ok, msg = await run_blocking(do_send)
+        if not ok:
+            return {"server": True, "success": False, "ok": False, "msg": msg, "error": msg}
 
-        if from_user in to_lists.get("blocked_list", []):
-            return {"server": True, "success": False, "msg": "You are blocked by this user."}
+        my_snap = await run_blocking(_relationship_snapshot, from_user)
+        other_snap = await run_blocking(_relationship_snapshot, to_)
+        await _push_relationship_to_user(from_user, my_snap, "request_sent", to_)
+        await _push_relationship_to_user(to_, other_snap, "request_received", from_user)
 
-        if to_ in from_lists.get("friend_list", []):
-            return {"server": True, "success": False, "msg": "This user is already your friend."}
-
-        if to_ in from_lists.get("outgoing_list", []):
-            return {"server": True, "success": False, "msg": "Friend request already sent."}
-
-        if to_ in from_lists.get("incoming_list", []) or from_user in to_lists.get("outgoing_list", []):
-            return {"server": True, "success": False, "msg": "This user has already sent you a friend request."}
-
-        all_type_list_table.update_one({"_id": from_user}, {"$addToSet": {"outgoing_list": to_}})
-        all_type_list_table.update_one({"_id": to_}, {"$addToSet": {"incoming_list": from_user}})
-
-        return {"server": True, "success": True, "msg": "Friend request sent successfully."}
+        return {"server": True, "success": True, "ok": True, "msg": msg, "lists": my_snap}
 
     except Exception as e:
-        return {"server": False, "success": False, "msg": f"error {e}"}
+        print(f"[send_friend_request] error: {e}")
+        return {"server": False, "success": False, "ok": False, "msg": f"error {e}", "error": str(e)}
+
+
+
+
 
 
 @app.post("/retract_friend_request")
