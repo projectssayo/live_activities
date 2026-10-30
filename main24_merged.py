@@ -2810,8 +2810,23 @@ def _pop_pending_notifications_blocking(user_email: str) -> List[dict]:
     return out
 
 
+@app.get("/get_relationships")
+async def get_relationships(email: str):
+    try:
+        snap = await run_blocking(_relationship_snapshot, email)
+        return {"ok": True, "success": True, "lists": snap}
+    except Exception as e:
+        print(f"[get_relationships] error: {e}")
+        return {"ok": False, "success": False, "error": str(e), "lists": {}}
+
+
+
+
 
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="127.0.0.1", port=8000)
+
+
+
